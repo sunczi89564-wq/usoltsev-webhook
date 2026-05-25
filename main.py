@@ -141,6 +141,11 @@ USDT.D: {usdt_d.get('price', 0):.2f}%
 
     send_telegram(text)
     return "OK", 200
+    
+@app.route("/test_morning")
+def test_morning():
+    morning_report()
+    return "Утренний обзор отправлен!", 200
 
 @app.route("/")
 def index():
