@@ -16,7 +16,7 @@ def get_prices():
         symbols = ["BTCUSDT", "ETHUSDT", "LINKUSDT"]
         prices = {}
         for symbol in symbols:
-            url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}"
+            url = "https://api.binance.com/api/v3/ticker/24hr?symbol=" + symbol
             r = requests.get(url, timeout=5).json()
             prices[symbol] = {
                 "price": float(r["lastPrice"]),
@@ -34,12 +34,12 @@ def get_fear_greed():
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()
         value = r["data"][0]["value"]
         label = r["data"][0]["value_classification"]
-        return f"{value} — {label}"
+        return value + " - " + label
     except:
         return "N/A"
 
 def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
     requests.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
@@ -52,18 +52,22 @@ def get_claude_opinion(signal, ticker, price, prices):
         btc = prices.get("BTCUSDT", {})
         eth = prices.get("ETHUSDT", {})
         usdt_d = prices.get("USDT.D", {})
-        prompt = f"""Ты торговый аналитик. Дай краткое мнение (3-4 предложения) по сигналу:
-
-Сигнал: {signal}
-Тикер: {ticker}
-Цена: {price}
-
-Текущий рынок:
-- BTC: ${btc.get('price', 'N/A')} ({btc.get('change', 0):+.2f}%)
-- ETH: ${eth.get('price', 'N/A')} ({eth.get('change', 0):+.2f}%)
-- USDT Dominance: {usdt_d.get('price', 'N/A'):.2f}%
-
-Оцени: качество сигнала, подтверждает ли макро картина, на что обратить внимание. Будь конкретен и краток."""
+        btc_price = btc.get("price", 0) or 0
+        btc_change = btc.get("change", 0) or 0
+        eth_price = eth.get("price", 0) or 0
+        eth_change = eth.get("change", 0) or 0
+        usdt_price = usdt_d.get("price", 0) or 0
+        prompt = (
+            "Ты торговый аналитик. Дай краткое мнение (3-4 предложения) по сигналу:\n\n"
+            "Сигнал: " + signal + "\n"
+            "Тикер: " + ticker + "\n"
+            "Цена: " + str(price) + "\n\n"
+            "Текущий рынок:\n"
+            "- BTC: $" + str(btc_price) + " (" + str(btc_change) + "%)\n"
+            "- ETH: $" + str(eth_price) + " (" + str(eth_change) + "%)\n"
+            "- USDT Dominance: " + str(usdt_price) + "%\n\n"
+            "Оцени: качество сигнала, подтверждает ли макро картина, на что обратить внимание. Будь конкретен и краток."
+        )
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=300,
@@ -71,7 +75,7 @@ def get_claude_opinion(signal, ticker, price, prices):
         )
         return message.content[0].text
     except Exception as e:
-        return f"Аналитика недоступна: {str(e)}"
+        return "Аналитика недоступна: " + str(e)
 
 def morning_report():
     prices = get_prices()
@@ -81,32 +85,33 @@ def morning_report():
     link = prices.get("LINKUSDT", {})
     usdt_d = prices.get("USDT.D", {})
 
-    def arrow(change):
-        return "+" if change >= 0 else ""
+    btc_price = btc.get("price", 0) or 0
+    btc_change = btc.get("change", 0) or 0
+    eth_price = eth.get("price", 0) or 0
+    eth_change = eth.get("change", 0) or 0
+    link_price = link.get("price", 0) or 0
+    link_change = link.get("change", 0) or 0
+    usdt_price = usdt_d.get("price", 0) or 0
 
-    text = f"""&#9728; <b>УТРЕННИЙ ОБЗОР</b>
-{datetime.now().strftime('%d.%m.%Y')}
-——————————————
-btc_price = btc.get('price', 0) or 0
-btc_change = btc.get('change', 0) or 0
-eth_price = eth.get('price', 0) or 0
-eth_change = eth.get('change', 0) or 0
-link_price = link.get('price', 0) or 0
-link_change = link.get('change', 0) or 0
-usdt_price = usdt_d.get('price', 0) or 0
-
-text = f"""&#9728; <b>УТРЕННИЙ ОБЗОР</b>
-{datetime.now().strftime('%d.%m.%Y')}
-——————————————
-<b>BTC</b>: ${btc_price:,.0f} ({arrow(btc_change)}{btc_change:.2f}%)
-<b>ETH</b>: ${eth_price:,.2f} ({arrow(eth_change)}{eth_change:.2f}%)
-<b>LINK</b>: ${link_price:,.2f} ({arrow(link_change)}{link_change:.2f}%)
-<b>USDT.D</b>: {usdt_price:.2f}%
-
-<b>Индекс страха/жадности:</b> {fg}
-——————————————
-<i>Usoltsev Signals</i>"""
+    line = "------------------------------"
+    text = (
+        "&#9728; <b>UTRENНИЙ ОБЗОР</b>\n"
+        + datetime.now().strftime("%d.%m.%Y") + "\n"
+        + line + "\n"
+        + "<b>BTC</b>: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
+        + "<b>ETH</b>: $" + "{:,.2f}".format(eth_price) + " (" + "{:+.2f}".format(eth_change) + "%)\n"
+        + "<b>LINK</b>: $" + "{:,.2f}".format(link_price) + " (" + "{:+.2f}".format(link_change) + "%)\n"
+        + "<b>USDT.D</b>: " + "{:.2f}".format(usdt_price) + "%\n\n"
+        + "<b>Индекс страха/жадности:</b> " + fg + "\n"
+        + line + "\n"
+        + "<i>Usoltsev Signals</i>"
+    )
     send_telegram(text)
+
+@app.route("/test_morning")
+def test_morning():
+    morning_report()
+    return "Утренний обзор отправлен!", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -133,37 +138,34 @@ def webhook():
     opinion = get_claude_opinion(signal, ticker, price, prices)
     btc = prices.get("BTCUSDT", {})
     usdt_d = prices.get("USDT.D", {})
+    btc_price = btc.get("price", 0) or 0
+    btc_change = btc.get("change", 0) or 0
+    usdt_price = usdt_d.get("price", 0) or 0
 
-    def arrow(change):
-        return "+" if change >= 0 else ""
-
-    text = f"""{emoji} <b>{sig_text} — {ticker}</b>
-&#128176; Цена: <b>${price}</b>
-&#128336; Время: {time}
-——————————————
-&#128202; <b>Рынок сейчас:</b>
-BTC: ${btc.get('price', 0):,.0f} ({arrow(btc.get('change',0))}{btc.get('change', 0):.2f}%)
-USDT.D: {usdt_d.get('price', 0):.2f}%
-——————————————
-&#129504; <b>Мнение Claude:</b>
-{opinion}
-——————————————
-<i>Usoltsev Signals</i>"""
-
+    line = "------------------------------"
+    text = (
+        emoji + " <b>" + sig_text + " - " + ticker + "</b>\n"
+        + "&#128176; Цена: <b>$" + str(price) + "</b>\n"
+        + "&#128336; Время: " + str(time) + "\n"
+        + line + "\n"
+        + "&#128202; <b>Рынок сейчас:</b>\n"
+        + "BTC: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
+        + "USDT.D: " + "{:.2f}".format(usdt_price) + "%\n"
+        + line + "\n"
+        + "&#129504; <b>Мнение Claude:</b>\n"
+        + opinion + "\n"
+        + line + "\n"
+        + "<i>Usoltsev Signals</i>"
+    )
     send_telegram(text)
     return "OK", 200
-    
-@app.route("/test_morning")
-def test_morning():
-    morning_report()
-    return "Утренний обзор отправлен!", 200
 
 @app.route("/")
 def index():
     return "Webhook работает!", 200
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(morning_report, 'cron', hour=6, minute=0)
+scheduler.add_job(morning_report, "cron", hour=6, minute=0)
 scheduler.start()
 
 if __name__ == "__main__":
