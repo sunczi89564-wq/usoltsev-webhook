@@ -13,20 +13,30 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 def get_prices():
     try:
-        symbols = ["BTCUSDT", "ETHUSDT", "LINKUSDT"]
-        prices = {}
-        for symbol in symbols:
-            url = "https://api.binance.com/api/v3/ticker/24hr?symbol=" + symbol
-            r = requests.get(url, timeout=5).json()
-            prices[symbol] = {
-                "price": float(r["lastPrice"]),
-                "change": float(r["priceChangePercent"])
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,chainlink&vs_currencies=usd&include_24hr_change=true"
+        r = requests.get(url, timeout=10).json()
+        g = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
+        usdt_d = g["data"]["market_cap_percentage"]["usdt"]
+        prices = {
+            "BTCUSDT": {
+                "price": r["bitcoin"]["usd"],
+                "change": r["bitcoin"]["usd_24h_change"]
+            },
+            "ETHUSDT": {
+                "price": r["ethereum"]["usd"],
+                "change": r["ethereum"]["usd_24h_change"]
+            },
+            "LINKUSDT": {
+                "price": r["chainlink"]["usd"],
+                "change": r["chainlink"]["usd_24h_change"]
+            },
+            "USDT.D": {
+                "price": usdt_d,
+                "change": 0
             }
-        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=5).json()
-        usdt_d = r["data"]["market_cap_percentage"]["usdt"]
-        prices["USDT.D"] = {"price": usdt_d, "change": 0}
+        }
         return prices
-    except:
+    except Exception as e:
         return {}
 
 def get_fear_greed():
@@ -63,9 +73,9 @@ def get_claude_opinion(signal, ticker, price, prices):
             "Тикер: " + ticker + "\n"
             "Цена: " + str(price) + "\n\n"
             "Текущий рынок:\n"
-            "- BTC: $" + str(btc_price) + " (" + str(btc_change) + "%)\n"
-            "- ETH: $" + str(eth_price) + " (" + str(eth_change) + "%)\n"
-            "- USDT Dominance: " + str(usdt_price) + "%\n\n"
+            "- BTC: $" + str(btc_price) + " (" + str(round(btc_change, 2)) + "%)\n"
+            "- ETH: $" + str(eth_price) + " (" + str(round(eth_change, 2)) + "%)\n"
+            "- USDT Dominance: " + str(round(usdt_price, 2)) + "%\n\n"
             "Оцени: качество сигнала, подтверждает ли макро картина, на что обратить внимание. Будь конкретен и краток."
         )
         message = client.messages.create(
@@ -95,7 +105,7 @@ def morning_report():
 
     line = "------------------------------"
     text = (
-        "&#9728; <b>UTRENНИЙ ОБЗОР</b>\n"
+        "&#9728; <b>УТРЕННИЙ ОБЗОР</b>\n"
         + datetime.now().strftime("%d.%m.%Y") + "\n"
         + line + "\n"
         + "<b>BTC</b>: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
@@ -171,3 +181,4 @@ scheduler.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
