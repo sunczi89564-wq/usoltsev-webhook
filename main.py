@@ -1,4 +1,3 @@
-Вот новый `main.py` — выдели всё старое и вставь это:
 
 ```python
 from flask import Flask, request
