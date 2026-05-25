@@ -87,10 +87,21 @@ def morning_report():
     text = f"""&#9728; <b>УТРЕННИЙ ОБЗОР</b>
 {datetime.now().strftime('%d.%m.%Y')}
 ——————————————
-<b>BTC</b>: ${btc.get('price', 'N/A'):,.0f} ({arrow(btc.get('change',0))}{btc.get('change', 0):.2f}%)
-<b>ETH</b>: ${eth.get('price', 'N/A'):,.2f} ({arrow(eth.get('change',0))}{eth.get('change', 0):.2f}%)
-<b>LINK</b>: ${link.get('price', 'N/A'):,.2f} ({arrow(link.get('change',0))}{link.get('change', 0):.2f}%)
-<b>USDT.D</b>: {usdt_d.get('price', 0):.2f}%
+btc_price = btc.get('price', 0) or 0
+btc_change = btc.get('change', 0) or 0
+eth_price = eth.get('price', 0) or 0
+eth_change = eth.get('change', 0) or 0
+link_price = link.get('price', 0) or 0
+link_change = link.get('change', 0) or 0
+usdt_price = usdt_d.get('price', 0) or 0
+
+text = f"""&#9728; <b>УТРЕННИЙ ОБЗОР</b>
+{datetime.now().strftime('%d.%m.%Y')}
+——————————————
+<b>BTC</b>: ${btc_price:,.0f} ({arrow(btc_change)}{btc_change:.2f}%)
+<b>ETH</b>: ${eth_price:,.2f} ({arrow(eth_change)}{eth_change:.2f}%)
+<b>LINK</b>: ${link_price:,.2f} ({arrow(link_change)}{link_change:.2f}%)
+<b>USDT.D</b>: {usdt_price:.2f}%
 
 <b>Индекс страха/жадности:</b> {fg}
 ——————————————
