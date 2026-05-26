@@ -125,7 +125,20 @@ def test_morning():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    # Принимаем и JSON и текст
+    try:
+        if request.content_type and "application/json" in request.content_type:
+            data = request.json or {}
+        else:
+            raw = request.data.decode("utf-8")
+            import json
+            try:
+                data = json.loads(raw)
+            except:
+                data = {"signal": raw, "ticker": "", "price": "", "time": ""}
+    except:
+        data = {}
+
     signal = data.get("signal", "")
     ticker = data.get("ticker", "")
     price  = data.get("price", "")
@@ -181,4 +194,3 @@ scheduler.start()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
