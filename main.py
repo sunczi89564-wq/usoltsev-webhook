@@ -5,13 +5,13 @@ import anthropic
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
 import json
+import xml.etree.ElementTree as ET
 
 app = Flask(__name__)
 
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
 CHAT_ID           = os.environ.get("CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-NEWS_API_KEY      = os.environ.get("NEWS_API_KEY")
 
 def get_crypto_prices():
     try:
@@ -80,28 +80,32 @@ def get_fear_greed():
         return "N/A"
 
 def get_news():
-    try:
-        url = (
-            "https://newsapi.org/v2/everything"
-            "?q=bitcoin+OR+crypto+OR+fed+OR+gold+OR+oil"
-            "&language=en"
-            "&sortBy=publishedAt"
-            "&pageSize=5"
-            "&apiKey=" + NEWS_API_KEY
-        )
-        r = requests.get(url, timeout=8).json()
-        articles = r.get("articles", [])
-        news_lines = []
-        for a in articles[:3]:
-            title = a.get("title", "")
-            if title and "[Removed]" not in title:
-                # Обрезаем длинные заголовки
-                if len(title) > 80:
-                    title = title[:80] + "..."
-                news_lines.append("- " + title)
-        return "\n".join(news_lines) if news_lines else "Новости недоступны"
-    except:
-        return "Новости недоступны"
+    sources = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+        "https://decrypt.co/feed",
+    ]
+    headlines = []
+    for url in sources:
+        if len(headlines) >= 3:
+            break
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(url, headers=headers, timeout=6)
+            root = ET.fromstring(r.content)
+            items = root.findall(".//item")
+            for item in items[:2]:
+                title = item.find("title")
+                if title is not None and title.text:
+                    text = title.text.strip()
+                    if len(text) > 80:
+                        text = text[:80] + "..."
+                    headlines.append("- " + text)
+                    if len(headlines) >= 3:
+                        break
+        except:
+            continue
+    return "\n".join(headlines) if headlines else "Новости временно недоступны"
 
 def send_telegram(text):
     url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
@@ -264,10 +268,6 @@ def webhook():
 def index():
     return "Webhook работает!", 200
 
-# Дайджест 3 раза в день по Екатеринбургу (UTC+5)
-# 09:00 = 04:00 UTC
-# 15:00 = 10:00 UTC
-# 19:00 = 14:00 UTC
 scheduler = BackgroundScheduler()
 scheduler.add_job(daily_report, "cron", hour=4,  minute=0)
 scheduler.add_job(daily_report, "cron", hour=10, minute=0)
