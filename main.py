@@ -11,64 +11,64 @@ app = Flask(__name__)
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
 CHAT_ID           = os.environ.get("CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+NEWS_API_KEY      = os.environ.get("NEWS_API_KEY")
 
 def get_crypto_prices():
     try:
         url = "https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC&tsyms=USD"
         r = requests.get(url, timeout=10).json()
         raw = r["RAW"]
-        btc_price = raw["BTC"]["USD"]["PRICE"]
-        btc_change = raw["BTC"]["USD"]["CHANGEPCT24HOUR"]
-        return {"price": btc_price, "change": btc_change}
+        return {
+            "price": raw["BTC"]["USD"]["PRICE"],
+            "change": raw["BTC"]["USD"]["CHANGEPCT24HOUR"]
+        }
     except:
         return {"price": 0, "change": 0}
 
 def get_btc_dominance():
     try:
-        r = requests.get("https://min-api.cryptocompare.com/data/top/mktcapfull?limit=10&tsym=USD", timeout=10).json()
-        total = 0
-        btc_cap = 0
-        for coin in r["Data"]:
-            cap = coin["RAW"]["USD"]["MKTCAP"]
-            total += cap
-            if coin["CoinInfo"]["Name"] == "BTC":
-                btc_cap = cap
-        dominance = (btc_cap / total * 100) if total > 0 else 0
-        return round(dominance, 2)
+        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
+        return round(r["data"]["market_cap_percentage"]["btc"], 2)
     except:
-        return 0
+        try:
+            url = "https://min-api.cryptocompare.com/data/top/totalvolfull?limit=20&tsym=USD"
+            r = requests.get(url, timeout=10).json()
+            total = sum([c["RAW"]["USD"]["MKTCAP"] for c in r["Data"] if "RAW" in c and "USD" in c["RAW"]])
+            btc = next((c["RAW"]["USD"]["MKTCAP"] for c in r["Data"] if c["CoinInfo"]["Name"] == "BTC" and "RAW" in c), 0)
+            return round(btc / total * 100, 2) if total > 0 else 0
+        except:
+            return 0
 
 def get_traditional_prices():
-    try:
-        # Золото и нефть через Yahoo Finance
-        results = {}
-        pairs = {
-            "GC=F": "gold",
-            "BZ=F": "brent",
-            "DX-Y.NYB": "dxy",
-            "USDRUB=X": "usdrub",
-            "AEDUSД=X": "aedusd"
-        }
-        for symbol, key in pairs.items():
-            try:
-                url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=2d"
-                headers = {"User-Agent": "Mozilla/5.0"}
-                r = requests.get(url, headers=headers, timeout=8).json()
-                closes = r["chart"]["result"][0]["indicators"]["quote"][0]["close"]
-                closes = [x for x in closes if x is not None]
-                if len(closes) >= 2:
-                    price = closes[-1]
-                    prev = closes[-2]
-                    change = (price - prev) / prev * 100
-                else:
-                    price = closes[-1] if closes else 0
-                    change = 0
-                results[key] = {"price": price, "change": change}
-            except:
-                results[key] = {"price": 0, "change": 0}
-        return results
-    except:
-        return {}
+    results = {}
+    pairs = {
+        "GC=F":      "gold",
+        "BZ=F":      "brent",
+        "DX-Y.NYB":  "dxy",
+        "USDRUB=X":  "usdrub",
+        "AEDUSД=X":  "aedusd"
+    }
+    for symbol, key in pairs.items():
+        try:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=5d"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            r = requests.get(url, headers=headers, timeout=8).json()
+            closes = r["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes = [x for x in closes if x is not None]
+            if len(closes) >= 2:
+                price = closes[-1]
+                prev = closes[-2]
+                change = (price - prev) / prev * 100
+            elif len(closes) == 1:
+                price = closes[-1]
+                change = 0
+            else:
+                price = 0
+                change = 0
+            results[key] = {"price": round(price, 4), "change": round(change, 2)}
+        except:
+            results[key] = {"price": 0, "change": 0}
+    return results
 
 def get_fear_greed():
     try:
@@ -79,6 +79,30 @@ def get_fear_greed():
     except:
         return "N/A"
 
+def get_news():
+    try:
+        url = (
+            "https://newsapi.org/v2/everything"
+            "?q=bitcoin+OR+crypto+OR+fed+OR+gold+OR+oil"
+            "&language=en"
+            "&sortBy=publishedAt"
+            "&pageSize=5"
+            "&apiKey=" + NEWS_API_KEY
+        )
+        r = requests.get(url, timeout=8).json()
+        articles = r.get("articles", [])
+        news_lines = []
+        for a in articles[:3]:
+            title = a.get("title", "")
+            if title and "[Removed]" not in title:
+                # Обрезаем длинные заголовки
+                if len(title) > 80:
+                    title = title[:80] + "..."
+                news_lines.append("- " + title)
+        return "\n".join(news_lines) if news_lines else "Новости недоступны"
+    except:
+        return "Новости недоступны"
+
 def send_telegram(text):
     url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
     requests.post(url, json={
@@ -87,7 +111,7 @@ def send_telegram(text):
         "parse_mode": "HTML"
     })
 
-def get_claude_opinion(signal, ticker, price, btc_price, btc_change, usdt_d):
+def get_claude_opinion(signal, ticker, price, btc_price, btc_change, btc_d):
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         prompt = (
@@ -97,7 +121,7 @@ def get_claude_opinion(signal, ticker, price, btc_price, btc_change, usdt_d):
             "Цена: " + str(price) + "\n\n"
             "Текущий рынок:\n"
             "- BTC: $" + str(btc_price) + " (" + str(round(btc_change, 2)) + "%)\n"
-            "- BTC Dominance: " + str(usdt_d) + "%\n\n"
+            "- BTC Dominance: " + str(btc_d) + "%\n\n"
             "Оцени: качество сигнала, подтверждает ли макро картина, на что обратить внимание. Будь конкретен и краток."
         )
         message = client.messages.create(
@@ -107,22 +131,23 @@ def get_claude_opinion(signal, ticker, price, btc_price, btc_change, usdt_d):
         )
         return message.content[0].text
     except Exception as e:
-        return "Аналитика недоступна: " + str(e)
+        return "Аналитика временно недоступна"
 
-def morning_report():
+def daily_report():
     btc = get_crypto_prices()
     btc_d = get_btc_dominance()
     trad = get_traditional_prices()
     fg = get_fear_greed()
+    news = get_news()
 
     btc_price  = btc.get("price", 0) or 0
     btc_change = btc.get("change", 0) or 0
 
-    gold       = trad.get("gold", {})
-    brent      = trad.get("brent", {})
-    dxy        = trad.get("dxy", {})
-    usdrub     = trad.get("usdrub", {})
-    aedusd     = trad.get("aedusd", {})
+    gold   = trad.get("gold",   {})
+    brent  = trad.get("brent",  {})
+    dxy    = trad.get("dxy",    {})
+    usdrub = trad.get("usdrub", {})
+    aedusd = trad.get("aedusd", {})
 
     gold_price   = gold.get("price", 0) or 0
     gold_change  = gold.get("change", 0) or 0
@@ -130,22 +155,25 @@ def morning_report():
     brent_change = brent.get("change", 0) or 0
     dxy_price    = dxy.get("price", 0) or 0
     dxy_change   = dxy.get("change", 0) or 0
+    rub_price    = usdrub.get("price", 0) or 0
+    rub_change   = usdrub.get("change", 0) or 0
+    aed_price    = aedusd.get("price", 3.6725) or 3.6725
+    aed_change   = aedusd.get("change", 0) or 0
+    rub_aed      = round(rub_price / aed_price, 2) if aed_price > 0 else 0
 
-    # RUB/USD и AED/USD
-    rub_price  = usdrub.get("price", 0) or 0
-    rub_change = usdrub.get("change", 0) or 0
-    aed_price  = aedusd.get("price", 3.6725) or 3.6725
-    aed_change = aedusd.get("change", 0) or 0
-
-    # RUB/AED = RUB/USD / AED/USD * обратно
-    # 1 USD = rub_price RUB, 1 USD = aed_price AED
-    # 1 AED = rub_price / aed_price RUB
-    rub_aed = (rub_price / aed_price) if aed_price > 0 else 0
+    now = datetime.now()
+    hour = now.hour
+    if hour == 4:
+        greeting = "&#9728; <b>УТРЕННИЙ ДАЙДЖЕСТ</b>"
+    elif hour == 10:
+        greeting = "&#127774; <b>ДНЕВНОЙ ДАЙДЖЕСТ</b>"
+    else:
+        greeting = "&#127762; <b>ВЕЧЕРНИЙ ДАЙДЖЕСТ</b>"
 
     line = "------------------------------"
     text = (
-        "&#9728; <b>УТРЕННИЙ ОБЗОР</b>\n"
-        + datetime.now().strftime("%d.%m.%Y") + "\n"
+        greeting + "\n"
+        + now.strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
         + line + "\n"
         + "&#129377; <b>КРИПТО</b>\n"
         + "BTC: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
@@ -161,6 +189,9 @@ def morning_report():
         + "USD/AED: " + "{:.4f}".format(aed_price) + " (" + "{:+.2f}".format(aed_change) + "%)\n"
         + "AED/RUB: " + "{:.2f}".format(rub_aed) + "\n"
         + line + "\n"
+        + "&#128240; <b>НОВОСТИ</b>\n"
+        + news + "\n"
+        + line + "\n"
         + "&#128561; <b>Индекс страха/жадности:</b> " + fg + "\n"
         + line + "\n"
         + "<i>Usoltsev Signals</i>"
@@ -169,8 +200,8 @@ def morning_report():
 
 @app.route("/test_morning")
 def test_morning():
-    morning_report()
-    return "Утренний обзор отправлен!", 200
+    daily_report()
+    return "Дайджест отправлен!", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -233,8 +264,14 @@ def webhook():
 def index():
     return "Webhook работает!", 200
 
+# Дайджест 3 раза в день по Екатеринбургу (UTC+5)
+# 09:00 = 04:00 UTC
+# 15:00 = 10:00 UTC
+# 19:00 = 14:00 UTC
 scheduler = BackgroundScheduler()
-scheduler.add_job(morning_report, "cron", hour=6, minute=0)
+scheduler.add_job(daily_report, "cron", hour=4,  minute=0)
+scheduler.add_job(daily_report, "cron", hour=10, minute=0)
+scheduler.add_job(daily_report, "cron", hour=14, minute=0)
 scheduler.start()
 
 if __name__ == "__main__":
