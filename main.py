@@ -40,13 +40,13 @@ def get_btc_dominance():
 def get_altseason_index():
     try:
         # Берём топ-50 монет по капитализации
-        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&price_change_percentage=90d"
+        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&price_change_percentage=7d"
         r = requests.get(url, timeout=10).json()
         # Находим изменение BTC за 90 дней
         btc_change = None
         for coin in r:
             if coin["id"] == "bitcoin":
-                btc_change = coin.get("price_change_percentage_90d_in_currency", 0) or 0
+                btc_change = coin.get("price_change_percentage_7d_in_currency", 0) or 0
                 break
         if btc_change is None:
             return None
@@ -56,7 +56,7 @@ def get_altseason_index():
         for coin in r:
             if coin["id"] == "bitcoin":
                 continue
-            change = coin.get("price_change_percentage_90d_in_currency", None)
+            change = coin.get("price_change_percentage_7d_in_currency", None)
             if change is not None:
                 total += 1
                 if change > btc_change:
