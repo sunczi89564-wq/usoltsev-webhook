@@ -13,7 +13,6 @@ BOT_TOKEN    = os.environ.get("BOT_TOKEN")
 CHAT_ID      = os.environ.get("CHAT_ID")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-# Буфер сигналов
 signal_buffer = []
 buffer_lock = threading.Lock()
 buffer_timer = None
@@ -40,36 +39,43 @@ def get_btc_dominance():
 
 def get_altseason_index():
     try:
-        url = "https://blockchaincenter.net/altcoin-season-index/"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=8)
-        # Ищем значение индекса в HTML
-        text = r.text
-        idx = text.find('"altcoinSeason":')
-        if idx != -1:
-            val = text[idx+16:idx+19].strip().rstrip(',').rstrip('}')
-            return int(val)
-        # Второй вариант парсинга
-        idx = text.find("altcoin-season-index-value")
-        if idx != -1:
-            snippet = text[idx:idx+100]
-            for part in snippet.split(">"):
-                clean = part.replace("</span", "").replace("</div", "").strip()
-                if clean.isdigit():
-                    return int(clean)
-        return None
+        # Берём топ-50 монет по капитализации
+        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&price_change_percentage=90d"
+        r = requests.get(url, timeout=10).json()
+        # Находим изменение BTC за 90 дней
+        btc_change = None
+        for coin in r:
+            if coin["id"] == "bitcoin":
+                btc_change = coin.get("price_change_percentage_90d_in_currency", 0) or 0
+                break
+        if btc_change is None:
+            return None
+        # Считаем сколько монет обогнали BTC
+        count = 0
+        total = 0
+        for coin in r:
+            if coin["id"] == "bitcoin":
+                continue
+            change = coin.get("price_change_percentage_90d_in_currency", None)
+            if change is not None:
+                total += 1
+                if change > btc_change:
+                    count += 1
+        if total == 0:
+            return None
+        # Индекс = процент монет обогнавших BTC (0-100)
+        index = round(count / total * 100)
+        return index
     except:
         return None
 
 def get_total3():
     try:
-        # Total3 = общая капитализация минус BTC и ETH
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
         total = r["data"]["total_market_cap"]["usd"]
         btc_pct = r["data"]["market_cap_percentage"]["btc"] / 100
         eth_pct = r["data"]["market_cap_percentage"]["eth"] / 100
         total3 = total * (1 - btc_pct - eth_pct)
-        # Изменение за 24ч
         total_change = r["data"]["market_cap_change_percentage_24h_usd"]
         return {"value": total3, "change": total_change}
     except:
