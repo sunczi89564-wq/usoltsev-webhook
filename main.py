@@ -6,7 +6,6 @@ from datetime import datetime
 import json
 import xml.etree.ElementTree as ET
 import threading
-import time
 
 app = Flask(__name__)
 
@@ -37,14 +36,44 @@ def get_btc_dominance():
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
         return round(r["data"]["market_cap_percentage"]["btc"], 2)
     except:
-        try:
-            url = "https://min-api.cryptocompare.com/data/top/totalvolfull?limit=20&tsym=USD"
-            r = requests.get(url, timeout=10).json()
-            total = sum([c["RAW"]["USD"]["MKTCAP"] for c in r["Data"] if "RAW" in c and "USD" in c["RAW"]])
-            btc = next((c["RAW"]["USD"]["MKTCAP"] for c in r["Data"] if c["CoinInfo"]["Name"] == "BTC" and "RAW" in c), 0)
-            return round(btc / total * 100, 2) if total > 0 else 0
-        except:
-            return 0
+        return 0
+
+def get_altseason_index():
+    try:
+        url = "https://blockchaincenter.net/altcoin-season-index/"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=8)
+        # Ищем значение индекса в HTML
+        text = r.text
+        idx = text.find('"altcoinSeason":')
+        if idx != -1:
+            val = text[idx+16:idx+19].strip().rstrip(',').rstrip('}')
+            return int(val)
+        # Второй вариант парсинга
+        idx = text.find("altcoin-season-index-value")
+        if idx != -1:
+            snippet = text[idx:idx+100]
+            for part in snippet.split(">"):
+                clean = part.replace("</span", "").replace("</div", "").strip()
+                if clean.isdigit():
+                    return int(clean)
+        return None
+    except:
+        return None
+
+def get_total3():
+    try:
+        # Total3 = общая капитализация минус BTC и ETH
+        r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
+        total = r["data"]["total_market_cap"]["usd"]
+        btc_pct = r["data"]["market_cap_percentage"]["btc"] / 100
+        eth_pct = r["data"]["market_cap_percentage"]["eth"] / 100
+        total3 = total * (1 - btc_pct - eth_pct)
+        # Изменение за 24ч
+        total_change = r["data"]["market_cap_change_percentage_24h_usd"]
+        return {"value": total3, "change": total_change}
+    except:
+        return {"value": 0, "change": 0}
 
 def get_traditional_prices():
     results = {}
@@ -146,7 +175,7 @@ def get_groq_opinion(signals_text, btc_price, btc_change, btc_d):
                          headers=headers, json=data, timeout=15)
         result = r.json()
         return result["choices"][0]["message"]["content"]
-    except Exception as e:
+    except:
         return "Аналитика временно недоступна"
 
 def process_buffer():
@@ -159,13 +188,11 @@ def process_buffer():
         signal_buffer = []
         buffer_timer = None
 
-    # Получаем данные рынка
     btc = get_crypto_prices()
     btc_d = get_btc_dominance()
     btc_price = btc.get("price", 0) or 0
     btc_change = btc.get("change", 0) or 0
 
-    # Формируем список сигналов
     line = "------------------------------"
     signals_header = ""
     signals_text_for_ai = ""
@@ -174,25 +201,17 @@ def process_buffer():
         signal = s.get("signal", "")
         ticker = s.get("ticker", "")
         price  = s.get("price", "")
-        time   = s.get("time", "")
 
         if "LONG_STRONG" in signal:
             emoji = "&#128994;"
-            sig_text = "ЛОНГ СИЛЬНЫЙ"
-        elif "SHORT_STRONG" in signal:
-            emoji = "&#128308;"
-            sig_text = "ШОРТ СИЛЬНЫЙ"
-        elif "LONG_WEAK" in signal:
-            emoji = "&#128993;"
-            sig_text = "ЛОНГ СЛАБЫЙ"
+            sig_text = "ЛОНГ"
         else:
-            emoji = "&#128992;"
-            sig_text = "ШОРТ СЛАБЫЙ"
+            emoji = "&#128308;"
+            sig_text = "ШОРТ"
 
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + "\n"
         signals_text_for_ai += sig_text + " - " + ticker + " $" + str(price) + "\n"
 
-    # Получаем мнение ИИ по всем сигналам сразу
     opinion = get_groq_opinion(signals_text_for_ai, btc_price, btc_change, btc_d)
 
     count = str(len(signals))
@@ -212,12 +231,34 @@ def process_buffer():
     )
     send_telegram(text)
 
+def format_total3(value):
+    if value >= 1_000_000_000_000:
+        return "{:.2f}T".format(value / 1_000_000_000_000)
+    elif value >= 1_000_000_000:
+        return "{:.2f}B".format(value / 1_000_000_000)
+    else:
+        return "{:.2f}M".format(value / 1_000_000)
+
+def format_altseason(value):
+    if value is None:
+        return "N/A"
+    if value >= 75:
+        return str(value) + " - Альтсезон &#127881;"
+    elif value >= 50:
+        return str(value) + " - Нейтрально"
+    elif value >= 25:
+        return str(value) + " - Ближе к BTC"
+    else:
+        return str(value) + " - Сезон BTC &#128834;"
+
 def daily_report():
     btc = get_crypto_prices()
     btc_d = get_btc_dominance()
     trad = get_traditional_prices()
     fg = get_fear_greed()
     news = get_news()
+    altseason = get_altseason_index()
+    total3 = get_total3()
 
     btc_price  = btc.get("price", 0) or 0
     btc_change = btc.get("change", 0) or 0
@@ -240,6 +281,9 @@ def daily_report():
     aed_change   = aedusd.get("change", 0) or 0
     rub_aed      = round(rub_price / aed_price, 2) if aed_price > 0 else 0
 
+    total3_val    = total3.get("value", 0) or 0
+    total3_change = total3.get("change", 0) or 0
+
     now = datetime.now()
     hour = now.hour
     if hour == 4:
@@ -257,6 +301,8 @@ def daily_report():
         + "&#129377; <b>КРИПТО</b>\n"
         + "BTC: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
         + "BTC.D: " + "{:.2f}".format(btc_d) + "%\n"
+        + "Total3: " + format_total3(total3_val) + " (" + "{:+.2f}".format(total3_change) + "%)\n"
+        + "Альтсезон: " + format_altseason(altseason) + "\n"
         + line + "\n"
         + "&#127758; <b>МАКРО</b>\n"
         + "DXY: " + "{:.2f}".format(dxy_price) + " (" + "{:+.2f}".format(dxy_change) + "%)\n"
@@ -300,7 +346,6 @@ def webhook():
 
     with buffer_lock:
         signal_buffer.append(data)
-
         if buffer_timer is None:
             t = threading.Timer(BUFFER_SECONDS, process_buffer)
             t.daemon = True
