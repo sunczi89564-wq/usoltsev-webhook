@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 import xml.etree.ElementTree as ET
 import threading
+import time
 
 app = Flask(__name__)
 
@@ -33,16 +34,16 @@ def get_crypto_prices():
 def get_btc_dominance():
     try:
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
+        time.sleep(2)
         return round(r["data"]["market_cap_percentage"]["btc"], 2)
     except:
         return 0
 
 def get_altseason_index():
     try:
-        # Берём топ-50 монет по капитализации
+        time.sleep(3)
         url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&price_change_percentage=7d"
-        r = requests.get(url, timeout=10).json()
-        # Находим изменение BTC за 90 дней
+        r = requests.get(url, timeout=15).json()
         btc_change = None
         for coin in r:
             if coin["id"] == "bitcoin":
@@ -50,7 +51,6 @@ def get_altseason_index():
                 break
         if btc_change is None:
             return None
-        # Считаем сколько монет обогнали BTC
         count = 0
         total = 0
         for coin in r:
@@ -63,14 +63,13 @@ def get_altseason_index():
                     count += 1
         if total == 0:
             return None
-        # Индекс = процент монет обогнавших BTC (0-100)
-        index = round(count / total * 100)
-        return index
+        return round(count / total * 100)
     except:
         return None
 
 def get_total3():
     try:
+        time.sleep(2)
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
         total = r["data"]["total_market_cap"]["usd"]
         btc_pct = r["data"]["market_cap_percentage"]["btc"] / 100
@@ -260,11 +259,11 @@ def format_altseason(value):
 def daily_report():
     btc = get_crypto_prices()
     btc_d = get_btc_dominance()
+    total3 = get_total3()
+    altseason = get_altseason_index()
     trad = get_traditional_prices()
     fg = get_fear_greed()
     news = get_news()
-    altseason = get_altseason_index()
-    total3 = get_total3()
 
     btc_price  = btc.get("price", 0) or 0
     btc_change = btc.get("change", 0) or 0
@@ -308,7 +307,7 @@ def daily_report():
         + "BTC: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
         + "BTC.D: " + "{:.2f}".format(btc_d) + "%\n"
         + "Total3: " + format_total3(total3_val) + " (" + "{:+.2f}".format(total3_change) + "%)\n"
-        + "Альтсезон: " + format_altseason(altseason) + "\n"
+        + "Альтсезон (7d): " + format_altseason(altseason) + "\n"
         + line + "\n"
         + "&#127758; <b>МАКРО</b>\n"
         + "DXY: " + "{:.2f}".format(dxy_price) + " (" + "{:+.2f}".format(dxy_change) + "%)\n"
