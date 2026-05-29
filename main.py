@@ -171,7 +171,7 @@ def get_ai_opinion(signals_text, btc_price, btc_change, btc_d):
             "что говорит макро, на что обратить внимание. Будь конкретен и краток."
         )
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
