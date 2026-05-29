@@ -172,7 +172,7 @@ def get_groq_opinion(signals_text, btc_price, btc_change, btc_d):
             "что говорит макро, на что обратить внимание. Будь конкретен и краток."
         )
         data = {
-            "model": "llama3-8b-8192",
+            "model": "llama-3.1-8b-instant",
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 400
         }
