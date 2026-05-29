@@ -7,12 +7,13 @@ import json
 import xml.etree.ElementTree as ET
 import threading
 import time
+import anthropic
 
 app = Flask(__name__)
 
-BOT_TOKEN    = os.environ.get("BOT_TOKEN")
-CHAT_ID      = os.environ.get("CHAT_ID")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+BOT_TOKEN         = os.environ.get("BOT_TOKEN")
+CHAT_ID           = os.environ.get("CHAT_ID")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 signal_buffer = []
 buffer_lock = threading.Lock()
@@ -156,12 +157,10 @@ def send_telegram(text):
         "parse_mode": "HTML"
     })
 
-def get_groq_opinion(signals_text, btc_price, btc_change, btc_d):
+# === СТРОКА 115 — ФУНКЦИЯ АНАЛИТИКИ CLAUDE ===
+def get_ai_opinion(signals_text, btc_price, btc_change, btc_d):
     try:
-        headers = {
-            "Authorization": "Bearer " + str(GROQ_API_KEY),
-            "Content-Type": "application/json"
-        }
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         prompt = (
             "Ты торговый аналитик. Дай краткое мнение (4-5 предложений) на русском языке по следующим сигналам:\n\n"
             + signals_text + "\n\n"
@@ -171,22 +170,12 @@ def get_groq_opinion(signals_text, btc_price, btc_change, btc_d):
             "Оцени: общую картину по всем сигналам, есть ли подтверждение между монетами, "
             "что говорит макро, на что обратить внимание. Будь конкретен и краток."
         )
-        data = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 400
-        }
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=15
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
         )
-        result = r.json()
-        if "choices" in result:
-            return result["choices"][0]["message"]["content"]
-        else:
-            return "Ошибка Groq: " + str(result)
+        return message.content[0].text
     except Exception as e:
         return "Ошибка: " + str(e)
 
@@ -224,7 +213,7 @@ def process_buffer():
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + "\n"
         signals_text_for_ai += sig_text + " - " + ticker + " $" + str(price) + "\n"
 
-    opinion = get_groq_opinion(signals_text_for_ai, btc_price, btc_change, btc_d)
+    opinion = get_ai_opinion(signals_text_for_ai, btc_price, btc_change, btc_d)
 
     count = str(len(signals))
     text = (
@@ -236,7 +225,7 @@ def process_buffer():
         + "BTC: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
         + "BTC.D: " + "{:.2f}".format(btc_d) + "%\n"
         + line + "\n"
-        + "&#129504; <b>Мнение ИИ:</b>\n"
+        + "&#129504; <b>Мнение Claude:</b>\n"
         + opinion + "\n"
         + line + "\n"
         + "<i>Usoltsev Signals</i>"
@@ -346,8 +335,8 @@ def test_signal():
     btc_d = get_btc_dominance()
     btc_price = btc.get("price", 0) or 0
     btc_change = btc.get("change", 0) or 0
-    opinion = get_groq_opinion("LONG - BTCUSD $75000", btc_price, btc_change, btc_d)
-    return "GROQ_KEY: " + str(GROQ_API_KEY)[:10] + "... | Мнение: " + opinion, 200
+    opinion = get_ai_opinion("LONG - BTCUSD $75000", btc_price, btc_change, btc_d)
+    return "Мнение Claude: " + opinion, 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
