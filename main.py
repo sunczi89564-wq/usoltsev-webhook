@@ -159,7 +159,7 @@ def send_telegram(text):
 def get_groq_opinion(signals_text, btc_price, btc_change, btc_d):
     try:
         headers = {
-            "Authorization": "Bearer " + GROQ_API_KEY,
+            "Authorization": "Bearer " + str(GROQ_API_KEY),
             "Content-Type": "application/json"
         }
         prompt = (
@@ -176,12 +176,19 @@ def get_groq_opinion(signals_text, btc_price, btc_change, btc_d):
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 400
         }
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                         headers=headers, json=data, timeout=15)
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=15
+        )
         result = r.json()
-        return result["choices"][0]["message"]["content"]
-    except:
-        return "Аналитика временно недоступна"
+        if "choices" in result:
+            return result["choices"][0]["message"]["content"]
+        else:
+            return "Ошибка Groq: " + str(result)
+    except Exception as e:
+        return "Ошибка: " + str(e)
 
 def process_buffer():
     global signal_buffer, buffer_timer
@@ -207,7 +214,7 @@ def process_buffer():
         ticker = s.get("ticker", "")
         price  = s.get("price", "")
 
-        if "LONG_STRONG" in signal:
+        if "LONG" in signal:
             emoji = "&#128994;"
             sig_text = "ЛОНГ"
         else:
@@ -248,13 +255,13 @@ def format_altseason(value):
     if value is None:
         return "N/A"
     if value >= 75:
-        return str(value) + " - Альтсезон &#127881;"
+        return str(value) + " - Альтсезон"
     elif value >= 50:
         return str(value) + " - Нейтрально"
     elif value >= 25:
         return str(value) + " - Ближе к BTC"
     else:
-        return str(value) + " - Сезон BTC &#128834;"
+        return str(value) + " - Сезон BTC"
 
 def daily_report():
     btc = get_crypto_prices()
@@ -332,6 +339,15 @@ def daily_report():
 def test_morning():
     daily_report()
     return "Дайджест отправлен!", 200
+
+@app.route("/test_signal")
+def test_signal():
+    btc = get_crypto_prices()
+    btc_d = get_btc_dominance()
+    btc_price = btc.get("price", 0) or 0
+    btc_change = btc.get("change", 0) or 0
+    opinion = get_groq_opinion("LONG - BTCUSD $75000", btc_price, btc_change, btc_d)
+    return "GROQ_KEY: " + str(GROQ_API_KEY)[:10] + "... | Мнение: " + opinion, 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
