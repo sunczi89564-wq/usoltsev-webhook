@@ -7,19 +7,63 @@ import json
 import xml.etree.ElementTree as ET
 import threading
 import time
-import anthropic
 
 app = Flask(__name__)
 
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
-CHAT_ID           = os.environ.get("CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+
+# ═══════════════════════════════════════════════
+# CHAT ID и THREAD ID
+# ═══════════════════════════════════════════════
+GROUP_CHAT_ID   = "-1004230629656"   # Usoltsev Finance
+THREAD_GENERAL  = None               # General — дайджест
+THREAD_SCALP    = 2                  # Scalp — 15м и ниже
+THREAD_INTRADAY = 4                  # Intraday — 30м-4ч
+THREAD_HODL     = 8                  # HODL — 12ч+
+THREAD_RU       = 15                 # RU Market
+THREAD_US       = 18                 # US Market
+
+# Таймфреймы → топики (для крипто)
+TF_TO_THREAD = {
+    "1":   THREAD_SCALP,
+    "3":   THREAD_SCALP,
+    "5":   THREAD_SCALP,
+    "15":  THREAD_SCALP,
+    "30":  THREAD_INTRADAY,
+    "60":  THREAD_INTRADAY,
+    "120": THREAD_INTRADAY,
+    "240": THREAD_INTRADAY,
+    "720": THREAD_HODL,
+    "D":   THREAD_HODL,
+    "W":   THREAD_HODL,
+}
 
 signal_buffer = []
 buffer_lock = threading.Lock()
 buffer_timer = None
 BUFFER_SECONDS = 60
 
+# ═══════════════════════════════════════════════
+# ТИКЕРЫ
+# ═══════════════════════════════════════════════
+RUSSIAN_TICKERS = ["LKOH", "SBER", "GAZP", "ROSN", "NVTK", "GMKN", "YNDX",
+                   "TATN", "MAGN", "CHMF", "ALRS", "MTSS", "POLY", "PLZL"]
+
+US_TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META",
+              "NFLX", "AMD", "INTC", "SPY", "QQQ", "BABA"]
+
+def get_ticker_thread(ticker, tf="60"):
+    t = ticker.upper()
+    if any(t.startswith(r) for r in RUSSIAN_TICKERS):
+        return THREAD_RU
+    if any(t.startswith(u) for u in US_TICKERS):
+        return THREAD_US
+    return TF_TO_THREAD.get(str(tf), THREAD_INTRADAY)
+
+# ═══════════════════════════════════════════════
+# КРИПТО ДАННЫЕ
+# ═══════════════════════════════════════════════
 def get_crypto_prices():
     try:
         url = "https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC&tsyms=USD"
@@ -81,6 +125,9 @@ def get_total3():
     except:
         return {"value": 0, "change": 0}
 
+# ═══════════════════════════════════════════════
+# МАКРО ДАННЫЕ
+# ═══════════════════════════════════════════════
 def get_traditional_prices():
     results = {}
     pairs = {
@@ -88,7 +135,9 @@ def get_traditional_prices():
         "BZ=F":      "brent",
         "DX-Y.NYB":  "dxy",
         "USDRUB=X":  "usdrub",
-        "AEDUSД=X":  "aedusd"
+        "AEDUSД=X":  "aedusd",
+        "ES=F":      "es",
+        "IMOEX.ME":  "imoex",
     }
     for symbol, key in pairs.items():
         try:
@@ -149,36 +198,23 @@ def get_news():
             continue
     return "\n".join(headlines) if headlines else "Новости временно недоступны"
 
-def send_telegram(text):
+# ═══════════════════════════════════════════════
+# ОТПРАВКА В TELEGRAM
+# ═══════════════════════════════════════════════
+def send_telegram(text, thread_id=None):
     url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
-    requests.post(url, json={
-        "chat_id": CHAT_ID,
+    payload = {
+        "chat_id": GROUP_CHAT_ID,
         "text": text,
         "parse_mode": "HTML"
-    })
+    }
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
+    requests.post(url, json=payload)
 
-# === СТРОКА 115 — ФУНКЦИЯ АНАЛИТИКИ CLAUDE ===
-def get_ai_opinion(signals_text, btc_price, btc_change, btc_d):
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        prompt = (
-            "Ты торговый аналитик. Дай краткое мнение (4-5 предложений) на русском языке по следующим сигналам:\n\n"
-            + signals_text + "\n\n"
-            "Текущий рынок:\n"
-            "- BTC: $" + str(btc_price) + " (" + str(round(btc_change, 2)) + "%)\n"
-            "- BTC Dominance: " + str(btc_d) + "%\n\n"
-            "Оцени: общую картину по всем сигналам, есть ли подтверждение между монетами, "
-            "что говорит макро, на что обратить внимание. Будь конкретен и краток."
-        )
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return message.content[0].text
-    except Exception as e:
-        return "Ошибка: " + str(e)
-
+# ═══════════════════════════════════════════════
+# БУФЕР СИГНАЛОВ
+# ═══════════════════════════════════════════════
 def process_buffer():
     global signal_buffer, buffer_timer
 
@@ -189,31 +225,28 @@ def process_buffer():
         signal_buffer = []
         buffer_timer = None
 
-    btc = get_crypto_prices()
-    btc_d = get_btc_dominance()
-    btc_price = btc.get("price", 0) or 0
-    btc_change = btc.get("change", 0) or 0
-
     line = "------------------------------"
     signals_header = ""
-    signals_text_for_ai = ""
+
+    # Определяем топик по первому сигналу
+    first = signals[0]
+    ticker = first.get("ticker", "")
+    tf     = str(first.get("tf", "60"))
+    thread_id = get_ticker_thread(ticker, tf)
 
     for s in signals:
-        signal = s.get("signal", "")
+        sig    = s.get("signal", "")
         ticker = s.get("ticker", "")
         price  = s.get("price", "")
 
-        if "LONG" in signal:
-            emoji = "&#128994;"
+        if "LONG" in sig:
+            emoji    = "&#128994;"
             sig_text = "ЛОНГ"
         else:
-            emoji = "&#128308;"
+            emoji    = "&#128308;"
             sig_text = "ШОРТ"
 
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + "\n"
-        signals_text_for_ai += sig_text + " - " + ticker + " $" + str(price) + "\n"
-
-    opinion = get_ai_opinion(signals_text_for_ai, btc_price, btc_change, btc_d)
 
     count = str(len(signals))
     text = (
@@ -221,17 +254,13 @@ def process_buffer():
         + line + "\n"
         + signals_header
         + line + "\n"
-        + "&#128202; <b>Рынок сейчас:</b>\n"
-        + "BTC: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
-        + "BTC.D: " + "{:.2f}".format(btc_d) + "%\n"
-        + line + "\n"
-        + "&#129504; <b>Мнение Claude:</b>\n"
-        + opinion + "\n"
-        + line + "\n"
         + "<i>Usoltsev Signals</i>"
     )
-    send_telegram(text)
+    send_telegram(text, thread_id)
 
+# ═══════════════════════════════════════════════
+# ФОРМАТИРОВАНИЕ
+# ═══════════════════════════════════════════════
 def format_total3(value):
     if value >= 1_000_000_000_000:
         return "{:.2f}T".format(value / 1_000_000_000_000)
@@ -252,14 +281,17 @@ def format_altseason(value):
     else:
         return str(value) + " - Сезон BTC"
 
+# ═══════════════════════════════════════════════
+# ДАЙДЖЕСТ
+# ═══════════════════════════════════════════════
 def daily_report():
-    btc = get_crypto_prices()
-    btc_d = get_btc_dominance()
+    btc    = get_crypto_prices()
+    btc_d  = get_btc_dominance()
     total3 = get_total3()
     altseason = get_altseason_index()
-    trad = get_traditional_prices()
-    fg = get_fear_greed()
-    news = get_news()
+    trad   = get_traditional_prices()
+    fg     = get_fear_greed()
+    news   = get_news()
 
     btc_price  = btc.get("price", 0) or 0
     btc_change = btc.get("change", 0) or 0
@@ -269,6 +301,8 @@ def daily_report():
     dxy    = trad.get("dxy",    {})
     usdrub = trad.get("usdrub", {})
     aedusd = trad.get("aedusd", {})
+    es     = trad.get("es",     {})
+    imoex  = trad.get("imoex",  {})
 
     gold_price   = gold.get("price", 0) or 0
     gold_change  = gold.get("change", 0) or 0
@@ -280,8 +314,11 @@ def daily_report():
     rub_change   = usdrub.get("change", 0) or 0
     aed_price    = aedusd.get("price", 3.6725) or 3.6725
     aed_change   = aedusd.get("change", 0) or 0
+    es_price     = es.get("price", 0) or 0
+    es_change    = es.get("change", 0) or 0
+    imoex_price  = imoex.get("price", 0) or 0
+    imoex_change = imoex.get("change", 0) or 0
     rub_aed      = round(rub_price / aed_price, 2) if aed_price > 0 else 0
-
     total3_val    = total3.get("value", 0) or 0
     total3_change = total3.get("change", 0) or 0
 
@@ -309,6 +346,8 @@ def daily_report():
         + "DXY: " + "{:.2f}".format(dxy_price) + " (" + "{:+.2f}".format(dxy_change) + "%)\n"
         + "&#129351; Золото: $" + "{:,.2f}".format(gold_price) + " (" + "{:+.2f}".format(gold_change) + "%)\n"
         + "&#128738; Нефть Brent: $" + "{:.2f}".format(brent_price) + " (" + "{:+.2f}".format(brent_change) + "%)\n"
+        + "&#127950; ES1!: $" + "{:,.2f}".format(es_price) + " (" + "{:+.2f}".format(es_change) + "%)\n"
+        + "&#127479;&#127482; IMOEX: " + "{:,.2f}".format(imoex_price) + " (" + "{:+.2f}".format(imoex_change) + "%)\n"
         + line + "\n"
         + "&#128178; <b>ВАЛЮТЫ</b>\n"
         + "USD/RUB: " + "{:.2f}".format(rub_price) + " (" + "{:+.2f}".format(rub_change) + "%)\n"
@@ -322,8 +361,11 @@ def daily_report():
         + line + "\n"
         + "<i>Usoltsev Signals</i>"
     )
-    send_telegram(text)
+    send_telegram(text, THREAD_GENERAL)
 
+# ═══════════════════════════════════════════════
+# РОУТЫ
+# ═══════════════════════════════════════════════
 @app.route("/test_morning")
 def test_morning():
     daily_report()
@@ -331,12 +373,10 @@ def test_morning():
 
 @app.route("/test_signal")
 def test_signal():
-    btc = get_crypto_prices()
-    btc_d = get_btc_dominance()
-    btc_price = btc.get("price", 0) or 0
-    btc_change = btc.get("change", 0) or 0
-    opinion = get_ai_opinion("LONG - BTCUSD $75000", btc_price, btc_change, btc_d)
-    return "Мнение Claude: " + opinion, 200
+    with buffer_lock:
+        signal_buffer.append({"signal": "LONG", "ticker": "BTCUSD", "price": "75000", "tf": "60"})
+    process_buffer()
+    return "Тестовый сигнал отправлен!", 200
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -350,7 +390,7 @@ def webhook():
             try:
                 data = json.loads(raw)
             except:
-                data = {"signal": raw, "ticker": "", "price": "", "time": ""}
+                data = {"signal": raw, "ticker": "", "price": "", "tf": "60"}
     except:
         data = {}
 
