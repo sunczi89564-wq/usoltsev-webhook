@@ -239,12 +239,27 @@ def process_buffer():
         ticker = s.get("ticker", "")
         price  = s.get("price", "")
 
-        if "LONG" in sig:
-            emoji    = "&#128994;"
+        if sig == "LONG":
+            emoji    = "&#128994;"   # 🟢
             sig_text = "ЛОНГ"
-        else:
-            emoji    = "&#128308;"
+        elif sig == "SHORT":
+            emoji    = "&#128308;"   # 🔴
             sig_text = "ШОРТ"
+        elif sig == "BREAKOUT_UP":
+            emoji    = "&#128640;"   # 🚀
+            sig_text = "ПРОБОЙ ВВЕРХ"
+        elif sig == "BREAKOUT_DOWN":
+            emoji    = "&#128315;"   # 🔻
+            sig_text = "ПРОБОЙ ВНИЗ"
+        elif sig == "RETURN_LONG":
+            emoji    = "&#128260;"   # 🔄
+            sig_text = "ВОЗВРАТ ЛОНГ"
+        elif sig == "RETURN_SHORT":
+            emoji    = "&#128260;"   # 🔄
+            sig_text = "ВОЗВРАТ ШОРТ"
+        else:
+            emoji    = "&#9898;"     # ⚪
+            sig_text = sig or "СИГНАЛ"
 
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + "\n"
 
