@@ -622,9 +622,9 @@ def telegram_updates():
 
 @app.route("/set_telegram_webhook")
 def set_telegram_webhook():
-    base_url = request.url_root.rstrip("/")
+    webhook_url = "https://usoltsev-webhook-production.up.railway.app/telegram_updates"
     tg_url = "https://api.telegram.org/bot" + BOT_TOKEN + "/setWebhook"
-    r = requests.post(tg_url, json={"url": base_url + "/telegram_updates"})
+    r = requests.post(tg_url, json={"url": webhook_url})
     return r.text, 200
 
 @app.route("/")
