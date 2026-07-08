@@ -45,6 +45,157 @@ buffer_timer = None
 BUFFER_SECONDS = 60
 
 # ═══════════════════════════════════════════════
+# ИСТОРИЯ СДЕЛОК И СТАТИСТИКА
+# ═══════════════════════════════════════════════
+TRADES_FILE = "trades.json"
+DEPOSIT     = 100.0
+LEVERAGE    = 50
+BYBIT_FEE_PCT = 0.055   # средняя комиссия тейкера Bybit за одну сторону сделки, %
+
+trades_lock = threading.Lock()
+
+def load_trades_data():
+    if os.path.exists(TRADES_FILE):
+        try:
+            with open(TRADES_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"start_date": None, "open_positions": {}, "closed_trades": []}
+
+def save_trades_data(data):
+    try:
+        with open(TRADES_FILE, "w") as f:
+            json.dump(data, f)
+    except:
+        pass
+
+def f_price(p):
+    try:
+        return float(p)
+    except:
+        return None
+
+def process_trade_signal(ticker, sig, price):
+    """Обрабатывает LONG/SHORT сигнал: закрывает предыдущую позицию по тикеру
+    (если была) и открывает новую. Возвращает текст сравнения для вставки в сообщение,
+    либо None если сравнивать не с чем."""
+    if sig not in ("LONG", "SHORT"):
+        return None
+    price_val = f_price(price)
+    if price_val is None:
+        return None
+
+    with trades_lock:
+        data = load_trades_data()
+        if data["start_date"] is None:
+            data["start_date"] = datetime.now().strftime("%d.%m.%Y")
+
+        compare_text = None
+        prev = data["open_positions"].get(ticker)
+
+        if prev is not None:
+            prev_sig   = prev.get("signal")
+            prev_price = prev.get("price")
+            if prev_price:
+                change_pct = (price_val - prev_price) / prev_price * 100
+                if prev_sig == "LONG":
+                    pnl_pct = change_pct
+                else:
+                    pnl_pct = -change_pct
+
+                position_size = DEPOSIT * LEVERAGE
+                fee_usd = position_size * (BYBIT_FEE_PCT / 100) * 2   # вход + выход
+                is_same_direction = (prev_sig == sig)
+                breakeven_note = ""
+
+                if is_same_direction and pnl_pct > 0:
+                    # Стоп был передвинут в безубыток — реальный профит не берём,
+                    # считаем что зафиксировался в 0 (комиссию всё равно платим)
+                    pnl_usd = -fee_usd
+                    breakeven_note = " (безубыток, стоп в б/у)"
+                else:
+                    pnl_usd = position_size * (pnl_pct / 100) - fee_usd
+
+                result_emoji = "&#9989;" if pnl_usd >= 0 else "&#10060;"
+                reversal = " | &#128260; Разворот" if prev_sig != sig else ""
+
+                compare_text = (
+                    "&#8618; Пред: " + ("ЛОНГ" if prev_sig == "LONG" else "ШОРТ")
+                    + " $" + str(prev_price)
+                    + " (" + "{:+.2f}".format(pnl_pct) + "%, " + "{:+.2f}".format(pnl_usd) + "$ после комиссии" + breakeven_note + ") "
+                    + result_emoji + reversal
+                )
+
+                data["closed_trades"].append({
+                    "ticker": ticker,
+                    "signal": prev_sig,
+                    "open_price": prev_price,
+                    "close_price": price_val,
+                    "pnl_pct": pnl_pct,
+                    "pnl_usd": pnl_usd,
+                    "closed_at": datetime.now().isoformat()
+                })
+                # Ограничиваем историю последними 2000 сделками
+                if len(data["closed_trades"]) > 2000:
+                    data["closed_trades"] = data["closed_trades"][-2000:]
+
+        data["open_positions"][ticker] = {"signal": sig, "price": price_val, "opened_at": datetime.now().isoformat()}
+        save_trades_data(data)
+
+    return compare_text
+
+def calc_stats(period_hours):
+    with trades_lock:
+        data = load_trades_data()
+    trades = data.get("closed_trades", [])
+    start_date = data.get("start_date", "—")
+
+    cutoff = datetime.now().timestamp() - period_hours * 3600
+    filtered = []
+    for t in trades:
+        try:
+            ts = datetime.fromisoformat(t["closed_at"]).timestamp()
+            if ts >= cutoff:
+                filtered.append(t)
+        except:
+            continue
+
+    total = len(filtered)
+    wins  = sum(1 for t in filtered if t["pnl_usd"] >= 0)
+    losses = total - wins
+    winrate = (wins / total * 100) if total > 0 else 0
+    total_pnl = sum(t["pnl_usd"] for t in filtered)
+
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": losses,
+        "winrate": winrate,
+        "total_pnl": total_pnl,
+        "start_date": start_date
+    }
+
+def format_stats(period_name, period_hours):
+    s = calc_stats(period_hours)
+    line = "------------------------------"
+    pnl_emoji = "&#128200;" if s["total_pnl"] >= 0 else "&#128201;"
+    text = (
+        "&#128202; <b>СТАТИСТИКА — " + period_name + "</b>\n"
+        + line + "\n"
+        + "Сделок: " + str(s["total"]) + "\n"
+        + "&#9989; Профит: " + str(s["wins"]) + "  &#10060; Убыток: " + str(s["losses"]) + "\n"
+        + "Винрейт: " + "{:.1f}".format(s["winrate"]) + "%\n"
+        + pnl_emoji + " P&amp;L: " + "{:+.2f}".format(s["total_pnl"]) + "$\n"
+        + line + "\n"
+        + "Депозит: $" + str(int(DEPOSIT)) + " | Плечо: x" + str(LEVERAGE) + " | Комиссия Bybit учтена (0.055% x2)\n"
+        + "Статистика ведётся с: " + s["start_date"] + "\n"
+        + line + "\n"
+        + "<i>Usoltsev Signals</i>"
+    )
+    return text
+
+# ═══════════════════════════════════════════════
 # ТИКЕРЫ
 # ═══════════════════════════════════════════════
 RUSSIAN_TICKERS = ["LKOH", "SBER", "GAZP", "ROSN", "NVTK", "GMKN", "YNDX",
@@ -263,14 +414,38 @@ def process_buffer():
 
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + "\n"
 
-    count = str(len(signals))
-    text = (
-        "&#9889; <b>ПАКЕТ СИГНАЛОВ (" + count + ")</b>\n"
-        + line + "\n"
-        + signals_header
-        + line + "\n"
-        + "<i>Usoltsev Signals</i>"
-    )
+        target = s.get("target", "")
+        stop   = s.get("stop", "")
+        if target and stop:
+            try:
+                target_f = float(target)
+                stop_f   = float(stop)
+                signals_header += (
+                    "&#127919; Цель: $" + "{:.6g}".format(target_f)
+                    + "  &#128721; Стоп: $" + "{:.6g}".format(stop_f) + "\n"
+                )
+            except:
+                pass
+
+        compare = process_trade_signal(ticker, sig, price)
+        if compare:
+            signals_header += compare + "\n"
+
+    signal_count = len(signals)
+    if signal_count > 1:
+        text = (
+            "&#9889; <b>ПАКЕТ СИГНАЛОВ (" + str(signal_count) + ")</b>\n"
+            + line + "\n"
+            + signals_header
+            + line + "\n"
+            + "<i>Usoltsev Signals</i>"
+        )
+    else:
+        text = (
+            signals_header
+            + line + "\n"
+            + "<i>Usoltsev Signals</i>"
+        )
     send_telegram(text, thread_id)
 
 # ═══════════════════════════════════════════════
@@ -418,6 +593,39 @@ def webhook():
             buffer_timer = t
 
     return "OK", 200
+
+# ═══════════════════════════════════════════════
+# TELEGRAM BOT COMMANDS (webhook на входящие сообщения)
+# ═══════════════════════════════════════════════
+@app.route("/telegram_updates", methods=["POST"])
+def telegram_updates():
+    try:
+        update = request.json or {}
+    except:
+        update = {}
+
+    msg = update.get("message") or update.get("channel_post")
+    if not msg:
+        return "OK", 200
+
+    text      = (msg.get("text") or "").strip()
+    thread_id = msg.get("message_thread_id")
+
+    if text.startswith("/stats24h"):
+        send_telegram(format_stats("24 ЧАСА", 24), thread_id)
+    elif text.startswith("/statsweek"):
+        send_telegram(format_stats("НЕДЕЛЯ", 24 * 7), thread_id)
+    elif text.startswith("/statsmonth"):
+        send_telegram(format_stats("МЕСЯЦ", 24 * 30), thread_id)
+
+    return "OK", 200
+
+@app.route("/set_telegram_webhook")
+def set_telegram_webhook():
+    base_url = request.url_root.rstrip("/")
+    tg_url = "https://api.telegram.org/bot" + BOT_TOKEN + "/setWebhook"
+    r = requests.post(tg_url, json={"url": base_url + "/telegram_updates"})
+    return r.text, 200
 
 @app.route("/")
 def index():
