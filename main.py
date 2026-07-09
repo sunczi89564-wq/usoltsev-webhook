@@ -18,25 +18,25 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 # ═══════════════════════════════════════════════
 GROUP_CHAT_ID   = "-1004230629656"   # Usoltsev Finance
 THREAD_GENERAL  = None               # General — дайджест
-THREAD_SCALP    = 2                  # Scalp — 15м и ниже
-THREAD_INTRADAY = 4                  # Intraday — 30м-4ч
-THREAD_HODL     = 8                  # HODL — 12ч+
+THREAD_5M       = 116                # сигналы 5 минут
+THREAD_15M      = 117                # сигналы 15 минут
+THREAD_1H       = 118                # сигналы 1 час
 THREAD_RU       = 15                 # RU Market
 THREAD_US       = 18                 # US Market
 
 # Таймфреймы → топики (для крипто)
 TF_TO_THREAD = {
-    "1":   THREAD_SCALP,
-    "3":   THREAD_SCALP,
-    "5":   THREAD_SCALP,
-    "15":  THREAD_SCALP,
-    "30":  THREAD_INTRADAY,
-    "60":  THREAD_INTRADAY,
-    "120": THREAD_INTRADAY,
-    "240": THREAD_INTRADAY,
-    "720": THREAD_HODL,
-    "D":   THREAD_HODL,
-    "W":   THREAD_HODL,
+    "1":   THREAD_5M,
+    "3":   THREAD_5M,
+    "5":   THREAD_5M,
+    "15":  THREAD_15M,
+    "30":  THREAD_1H,
+    "60":  THREAD_1H,
+    "120": THREAD_1H,
+    "240": THREAD_1H,
+    "720": THREAD_1H,
+    "D":   THREAD_1H,
+    "W":   THREAD_1H,
 }
 
 signal_buffer = []
@@ -76,15 +76,17 @@ def f_price(p):
     except:
         return None
 
-def process_trade_signal(ticker, sig, price):
-    """Обрабатывает LONG/SHORT сигнал: закрывает предыдущую позицию по тикеру
-    (если была) и открывает новую. Возвращает текст сравнения для вставки в сообщение,
-    либо None если сравнивать не с чем."""
+def process_trade_signal(ticker, sig, price, tf="60"):
+    """Обрабатывает LONG/SHORT сигнал: закрывает предыдущую позицию по тикеру+таймфрейму
+    (если была) и открывает новую. Позиции 5м и 15м по одному тикеру независимы.
+    Возвращает текст сравнения для вставки в сообщение, либо None если сравнивать не с чем."""
     if sig not in ("LONG", "SHORT"):
         return None
     price_val = f_price(price)
     if price_val is None:
         return None
+
+    pos_key = ticker + "_" + str(tf)
 
     with trades_lock:
         data = load_trades_data()
@@ -92,7 +94,7 @@ def process_trade_signal(ticker, sig, price):
             data["start_date"] = datetime.now().strftime("%d.%m.%Y")
 
         compare_text = None
-        prev = data["open_positions"].get(ticker)
+        prev = data["open_positions"].get(pos_key)
 
         if prev is not None:
             prev_sig   = prev.get("signal")
@@ -140,7 +142,65 @@ def process_trade_signal(ticker, sig, price):
                 if len(data["closed_trades"]) > 2000:
                     data["closed_trades"] = data["closed_trades"][-2000:]
 
-        data["open_positions"][ticker] = {"signal": sig, "price": price_val, "opened_at": datetime.now().isoformat()}
+        data["open_positions"][pos_key] = {"signal": sig, "price": price_val, "tf": str(tf), "opened_at": datetime.now().isoformat()}
+        save_trades_data(data)
+
+    return compare_text
+
+def process_return_signal(ticker, sig, price, tf="60"):
+    """Возврат в канал как сигнал ЗАКРЫТИЯ противоположной позиции:
+    RETURN_SHORT (импульс вверх выдохся) закрывает открытый LONG,
+    RETURN_LONG (импульс вниз выдохся) закрывает открытый SHORT.
+    Позиция закрывается с реальным P&L, новая не открывается.
+    Работает в рамках того же таймфрейма (ключ ticker_tf)."""
+    if sig not in ("RETURN_LONG", "RETURN_SHORT"):
+        return None
+    price_val = f_price(price)
+    if price_val is None:
+        return None
+
+    close_direction = "SHORT" if sig == "RETURN_LONG" else "LONG"
+    pos_key = ticker + "_" + str(tf)
+
+    with trades_lock:
+        data = load_trades_data()
+        prev = data["open_positions"].get(pos_key)
+        if prev is None or prev.get("signal") != close_direction:
+            return None
+
+        prev_price = prev.get("price")
+        if not prev_price:
+            return None
+
+        change_pct = (price_val - prev_price) / prev_price * 100
+        pnl_pct = change_pct if close_direction == "LONG" else -change_pct
+
+        position_size = DEPOSIT * LEVERAGE
+        fee_usd = position_size * (BYBIT_FEE_PCT / 100) * 2
+        pnl_usd = position_size * (pnl_pct / 100) - fee_usd
+
+        result_emoji = "&#9989;" if pnl_usd >= 0 else "&#10060;"
+        compare_text = (
+            "&#128274; Закрыт " + ("ЛОНГ" if close_direction == "LONG" else "ШОРТ")
+            + " $" + str(prev_price)
+            + " (" + "{:+.2f}".format(pnl_pct) + "%, " + "{:+.2f}".format(pnl_usd) + "$ после комиссии) "
+            + result_emoji
+        )
+
+        data["closed_trades"].append({
+            "ticker": ticker,
+            "signal": close_direction,
+            "open_price": prev_price,
+            "close_price": price_val,
+            "pnl_pct": pnl_pct,
+            "pnl_usd": pnl_usd,
+            "closed_by": "return",
+            "closed_at": datetime.now().isoformat()
+        })
+        if len(data["closed_trades"]) > 2000:
+            data["closed_trades"] = data["closed_trades"][-2000:]
+
+        del data["open_positions"][pos_key]
         save_trades_data(data)
 
     return compare_text
@@ -167,12 +227,21 @@ def calc_stats(period_hours):
     winrate = (wins / total * 100) if total > 0 else 0
     total_pnl = sum(t["pnl_usd"] for t in filtered)
 
+    ret_trades = [t for t in filtered if t.get("closed_by") == "return"]
+    ret_total  = len(ret_trades)
+    ret_wins   = sum(1 for t in ret_trades if t["pnl_usd"] >= 0)
+    ret_winrate = (ret_wins / ret_total * 100) if ret_total > 0 else 0
+    ret_pnl    = sum(t["pnl_usd"] for t in ret_trades)
+
     return {
         "total": total,
         "wins": wins,
         "losses": losses,
         "winrate": winrate,
         "total_pnl": total_pnl,
+        "ret_total": ret_total,
+        "ret_winrate": ret_winrate,
+        "ret_pnl": ret_pnl,
         "start_date": start_date
     }
 
@@ -187,6 +256,7 @@ def format_stats(period_name, period_hours):
         + "&#9989; Профит: " + str(s["wins"]) + "  &#10060; Убыток: " + str(s["losses"]) + "\n"
         + "Винрейт: " + "{:.1f}".format(s["winrate"]) + "%\n"
         + pnl_emoji + " P&amp;L: " + "{:+.2f}".format(s["total_pnl"]) + "$\n"
+        + "&#128274; Закрыто по возврату: " + str(s["ret_total"]) + " (винрейт " + "{:.1f}".format(s["ret_winrate"]) + "%, " + "{:+.2f}".format(s["ret_pnl"]) + "$)\n"
         + line + "\n"
         + "Депозит: $" + str(int(DEPOSIT)) + " | Плечо: x" + str(LEVERAGE) + " | Комиссия Bybit учтена (0.055% x2)\n"
         + "Статистика ведётся с: " + s["start_date"] + "\n"
@@ -210,7 +280,7 @@ def get_ticker_thread(ticker, tf="60"):
         return THREAD_RU
     if any(t.startswith(u) for u in US_TICKERS):
         return THREAD_US
-    return TF_TO_THREAD.get(str(tf), THREAD_INTRADAY)
+    return TF_TO_THREAD.get(str(tf), THREAD_1H)
 
 # ═══════════════════════════════════════════════
 # КРИПТО ДАННЫЕ
@@ -427,9 +497,14 @@ def process_buffer():
             except:
                 pass
 
-        compare = process_trade_signal(ticker, sig, price)
+        sig_tf = str(s.get("tf", "60"))
+        compare = process_trade_signal(ticker, sig, price, sig_tf)
         if compare:
             signals_header += compare + "\n"
+
+        return_close = process_return_signal(ticker, sig, price, sig_tf)
+        if return_close:
+            signals_header += return_close + "\n"
 
     signal_count = len(signals)
     if signal_count > 1:
