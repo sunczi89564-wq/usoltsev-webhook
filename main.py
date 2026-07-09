@@ -52,7 +52,77 @@ DEPOSIT     = 100.0
 LEVERAGE    = 50
 BYBIT_FEE_PCT = 0.055   # средняя комиссия тейкера Bybit за одну сторону сделки, %
 
+# Отслеживание цен: порог хода в плюс, после которого считаем
+# что стоп был передвинут в безубыток, %
+BREAKEVEN_THRESHOLD_PCT = 0.3
+PRICE_POLL_SECONDS = 45   # период опроса цен Bybit
+
 trades_lock = threading.Lock()
+
+def to_bybit_symbol(ticker):
+    """FARTCOINUSDT.P -> FARTCOINUSDT, BTCUSD -> BTCUSDT"""
+    t = ticker.upper().replace(".P", "")
+    if not t.endswith("USDT") and t.endswith("USD"):
+        t = t[:-3] + "USDT"
+    return t
+
+def get_bybit_price(symbol):
+    try:
+        url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=" + symbol
+        r = requests.get(url, timeout=8).json()
+        lst = r.get("result", {}).get("list", [])
+        if lst:
+            return float(lst[0]["lastPrice"])
+    except:
+        pass
+    return None
+
+def price_tracker_loop():
+    """Фоновый поток: обновляет max_price/min_price по всем открытым позициям."""
+    while True:
+        try:
+            with trades_lock:
+                data = load_trades_data()
+                positions = dict(data.get("open_positions", {}))
+
+            if positions:
+                # Уникальные тикеры
+                tickers = {}
+                for pos_key, pos in positions.items():
+                    tk = pos_key.rsplit("_", 1)[0]
+                    tickers.setdefault(tk, []).append(pos_key)
+
+                prices = {}
+                for tk in tickers:
+                    p = get_bybit_price(to_bybit_symbol(tk))
+                    if p is not None:
+                        prices[tk] = p
+
+                if prices:
+                    with trades_lock:
+                        data = load_trades_data()
+                        changed = False
+                        for tk, keys in tickers.items():
+                            p = prices.get(tk)
+                            if p is None:
+                                continue
+                            for pos_key in keys:
+                                pos = data["open_positions"].get(pos_key)
+                                if pos is None:
+                                    continue
+                                mx = pos.get("max_price", pos["price"])
+                                mn = pos.get("min_price", pos["price"])
+                                if p > mx:
+                                    pos["max_price"] = p
+                                    changed = True
+                                if p < mn:
+                                    pos["min_price"] = p
+                                    changed = True
+                        if changed:
+                            save_trades_data(data)
+        except:
+            pass
+        time.sleep(PRICE_POLL_SECONDS)
 
 def load_trades_data():
     if os.path.exists(TRADES_FILE):
@@ -111,13 +181,22 @@ def process_trade_signal(ticker, sig, price, tf="60"):
                 is_same_direction = (prev_sig == sig)
                 breakeven_note = ""
 
-                if is_same_direction and pnl_pct > 0:
-                    # Стоп был передвинут в безубыток — реальный профит не берём,
-                    # считаем что зафиксировался в 0 (комиссию всё равно платим)
+                # Реальный максимальный ход в пользу позиции (из отслеживания цен)
+                mx = prev.get("max_price", prev_price)
+                mn = prev.get("min_price", prev_price)
+                if prev_sig == "LONG":
+                    favorable_pct = (mx - prev_price) / prev_price * 100
+                else:
+                    favorable_pct = (prev_price - mn) / prev_price * 100
+
+                if is_same_direction and favorable_pct >= BREAKEVEN_THRESHOLD_PCT:
+                    # Цена реально ходила в плюс >= порога — стоп был в безубытке
                     pnl_usd = -fee_usd
-                    breakeven_note = " (безубыток, стоп в б/у)"
+                    breakeven_note = " (безубыток, макс ход +" + "{:.2f}".format(favorable_pct) + "%)"
                 else:
                     pnl_usd = position_size * (pnl_pct / 100) - fee_usd
+                    if favorable_pct > 0:
+                        breakeven_note = " (макс ход +" + "{:.2f}".format(favorable_pct) + "%)"
 
                 result_emoji = "&#9989;" if pnl_usd >= 0 else "&#10060;"
                 reversal = " | &#128260; Разворот" if prev_sig != sig else ""
@@ -142,7 +221,7 @@ def process_trade_signal(ticker, sig, price, tf="60"):
                 if len(data["closed_trades"]) > 2000:
                     data["closed_trades"] = data["closed_trades"][-2000:]
 
-        data["open_positions"][pos_key] = {"signal": sig, "price": price_val, "tf": str(tf), "opened_at": datetime.now().isoformat()}
+        data["open_positions"][pos_key] = {"signal": sig, "price": price_val, "tf": str(tf), "max_price": price_val, "min_price": price_val, "opened_at": datetime.now().isoformat()}
         save_trades_data(data)
 
     return compare_text
@@ -711,6 +790,10 @@ scheduler.add_job(daily_report, "cron", hour=4,  minute=0)
 scheduler.add_job(daily_report, "cron", hour=10, minute=0)
 scheduler.add_job(daily_report, "cron", hour=14, minute=0)
 scheduler.start()
+
+# Фоновый поток отслеживания цен Bybit
+price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
+price_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
