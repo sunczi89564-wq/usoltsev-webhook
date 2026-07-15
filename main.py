@@ -365,16 +365,36 @@ def get_ticker_thread(ticker, tf="60"):
 # КРИПТО ДАННЫЕ
 # ═══════════════════════════════════════════════
 def get_crypto_prices():
+    # Основной источник: CryptoCompare
     try:
         url = "https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC&tsyms=USD"
         r = requests.get(url, timeout=10).json()
         raw = r["RAW"]
-        return {
-            "price": raw["BTC"]["USD"]["PRICE"],
-            "change": raw["BTC"]["USD"]["CHANGEPCT24HOUR"]
-        }
+        price = raw["BTC"]["USD"]["PRICE"]
+        change = raw["BTC"]["USD"]["CHANGEPCT24HOUR"]
+        if price and price > 0:
+            return {"price": price, "change": change}
     except:
-        return {"price": 0, "change": 0}
+        pass
+    # Резерв: CoinGecko simple/price
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true"
+        r = requests.get(url, timeout=10).json()
+        btc = r.get("bitcoin", {})
+        price = btc.get("usd", 0)
+        change = btc.get("usd_24h_change", 0) or 0
+        if price and price > 0:
+            return {"price": price, "change": change}
+    except:
+        pass
+    # Резерв 2: Bybit (у нас уже есть функция)
+    try:
+        p = get_bybit_price("BTCUSDT")
+        if p:
+            return {"price": p, "change": 0}
+    except:
+        pass
+    return {"price": 0, "change": 0}
 
 def get_btc_dominance():
     try:
@@ -428,6 +448,20 @@ def get_total3():
 # ═══════════════════════════════════════════════
 # МАКРО ДАННЫЕ
 # ═══════════════════════════════════════════════
+def get_imoex():
+    """Индекс Мосбиржи через официальный ISS API (Yahoo нестабилен с IMOEX.ME)."""
+    try:
+        url = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX.json?iss.meta=off&iss.only=marketdata&marketdata.columns=CURRENTVALUE,LASTTOPREVPRICE"
+        r = requests.get(url, timeout=8).json()
+        rows = r.get("marketdata", {}).get("data", [])
+        if rows and rows[0][0] is not None:
+            price  = float(rows[0][0])
+            change = float(rows[0][1]) if rows[0][1] is not None else 0
+            return {"price": round(price, 2), "change": round(change, 2)}
+    except:
+        pass
+    return {"price": 0, "change": 0}
+
 def get_traditional_prices():
     results = {}
     pairs = {
@@ -437,7 +471,6 @@ def get_traditional_prices():
         "USDRUB=X":  "usdrub",
         "AEDUSД=X":  "aedusd",
         "ES=F":      "es",
-        "IMOEX.ME":  "imoex",
     }
     for symbol, key in pairs.items():
         try:
@@ -646,7 +679,7 @@ def daily_report():
     usdrub = trad.get("usdrub", {})
     aedusd = trad.get("aedusd", {})
     es     = trad.get("es",     {})
-    imoex  = trad.get("imoex",  {})
+    imoex  = get_imoex()
 
     gold_price   = gold.get("price", 0) or 0
     gold_change  = gold.get("change", 0) or 0
