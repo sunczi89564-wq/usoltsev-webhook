@@ -18,26 +18,29 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 # ═══════════════════════════════════════════════
 GROUP_CHAT_ID   = "-1004230629656"   # Usoltsev Finance
 THREAD_GENERAL  = None               # General — дайджест
-THREAD_5M       = 116                # сигналы 5 минут
-THREAD_15M      = 117                # сигналы 15 минут
 THREAD_1H       = 118                # сигналы 1 час
+THREAD_4H       = 580                # 4 часа сигналы
+THREAD_12H      = 582                # 12 часов сигналы
+THREAD_1D       = 584                # 1 день сигналы
 THREAD_RU       = 15                 # RU Market
 THREAD_US       = 18                 # US Market
 
 # Таймфреймы → топики (для крипто)
 TF_TO_THREAD = {
-    "1":   THREAD_5M,
-    "3":   THREAD_5M,
-    "5":   THREAD_5M,
-    "15":  THREAD_15M,
-    "30":  THREAD_1H,
     "60":  THREAD_1H,
-    "120": THREAD_1H,
-    "240": THREAD_1H,
-    "720": THREAD_1H,
-    "D":   THREAD_1H,
-    "W":   THREAD_1H,
+    "240": THREAD_4H,
+    "720": THREAD_12H,
+    "D":   THREAD_1D,
 }
+
+# Явная связка thread_id -> tf-ключ (как в TF_TO_THREAD), нужна чтобы фильтровать closed_trades по tf
+THREAD_TO_TF = {
+    THREAD_1H:  "60",
+    THREAD_4H:  "240",
+    THREAD_12H: "720",
+    THREAD_1D:  "D",
+}
+TF_LABEL = {"60": "1ч", "240": "4ч", "720": "12ч", "D": "1д"}
 
 signal_buffer = []
 buffer_lock = threading.Lock()
@@ -56,8 +59,6 @@ BYBIT_FEE_PCT = 0.055   # средняя комиссия тейкера Bybit �
 # что стоп был передвинут в безубыток, %
 BREAKEVEN_THRESHOLD_PCT = 0.3
 PRICE_POLL_SECONDS = 45   # период опроса цен Bybit
-
-trades_lock = threading.Lock()
 
 def to_bybit_symbol(ticker):
     """FARTCOINUSDT.P -> FARTCOINUSDT, BTCUSD -> BTCUSDT"""
@@ -123,6 +124,8 @@ def price_tracker_loop():
         except:
             pass
         time.sleep(PRICE_POLL_SECONDS)
+
+trades_lock = threading.Lock()
 
 def load_trades_data():
     if os.path.exists(TRADES_FILE):
@@ -215,6 +218,7 @@ def process_trade_signal(ticker, sig, price, tf="60"):
                     "close_price": price_val,
                     "pnl_pct": pnl_pct,
                     "pnl_usd": pnl_usd,
+                    "tf": str(tf),
                     "closed_at": datetime.now().isoformat()
                 })
                 # Ограничиваем историю последними 2000 сделками
@@ -274,6 +278,7 @@ def process_return_signal(ticker, sig, price, tf="60"):
             "pnl_pct": pnl_pct,
             "pnl_usd": pnl_usd,
             "closed_by": "return",
+            "tf": str(tf),
             "closed_at": datetime.now().isoformat()
         })
         if len(data["closed_trades"]) > 2000:
@@ -284,7 +289,7 @@ def process_return_signal(ticker, sig, price, tf="60"):
 
     return compare_text
 
-def calc_stats(period_hours):
+def calc_stats(period_hours, tf_filter=None):
     with trades_lock:
         data = load_trades_data()
     trades = data.get("closed_trades", [])
@@ -295,8 +300,11 @@ def calc_stats(period_hours):
     for t in trades:
         try:
             ts = datetime.fromisoformat(t["closed_at"]).timestamp()
-            if ts >= cutoff:
-                filtered.append(t)
+            if ts < cutoff:
+                continue
+            if tf_filter is not None and t.get("tf") != tf_filter:
+                continue
+            filtered.append(t)
         except:
             continue
 
@@ -324,12 +332,13 @@ def calc_stats(period_hours):
         "start_date": start_date
     }
 
-def format_stats(period_name, period_hours):
-    s = calc_stats(period_hours)
+def format_stats(period_name, period_hours, tf_filter=None):
+    s = calc_stats(period_hours, tf_filter)
     line = "------------------------------"
     pnl_emoji = "&#128200;" if s["total_pnl"] >= 0 else "&#128201;"
+    tf_note = " (" + TF_LABEL.get(tf_filter, tf_filter) + ")" if tf_filter else " (все ТФ)"
     text = (
-        "&#128202; <b>СТАТИСТИКА — " + period_name + "</b>\n"
+        "&#128202; <b>СТАТИСТИКА — " + period_name + tf_note + "</b>\n"
         + line + "\n"
         + "Сделок: " + str(s["total"]) + "\n"
         + "&#9989; Профит: " + str(s["wins"]) + "  &#10060; Убыток: " + str(s["losses"]) + "\n"
@@ -449,18 +458,35 @@ def get_total3():
 # МАКРО ДАННЫЕ
 # ═══════════════════════════════════════════════
 def get_imoex():
-    """Индекс Мосбиржи через официальный ISS API (Yahoo нестабилен с IMOEX.ME)."""
+    """Индекс Мосбиржи через официальный ISS API (Yahoo нестабилен с IMOEX.ME).
+    Не гадаем имена колонок заранее — запрашиваем блок целиком и находим
+    нужные поля по фактическому списку columns, который вернул MOEX."""
     try:
-        url = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX.json?iss.meta=off&iss.only=marketdata&marketdata.columns=CURRENTVALUE,LASTTOPREVPRICE"
+        url = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX.json?iss.meta=off&iss.only=marketdata"
         r = requests.get(url, timeout=8).json()
-        rows = r.get("marketdata", {}).get("data", [])
-        if rows and rows[0][0] is not None:
-            price  = float(rows[0][0])
-            change = float(rows[0][1]) if rows[0][1] is not None else 0
-            return {"price": round(price, 2), "change": round(change, 2)}
+        md = r.get("marketdata", {})
+        cols = md.get("columns", [])
+        rows = md.get("data", [])
+        if not rows or not cols:
+            return {"price": 0, "change": 0}
+
+        row = rows[0]
+
+        def col_idx(*names):
+            for n in names:
+                if n in cols:
+                    return cols.index(n)
+            return None
+
+        price_i  = col_idx("CURRENTVALUE", "LASTVALUE")
+        change_i = col_idx("LASTCHANGEPRC", "LASTCHANGEPRCNT", "CHANGE", "LASTTOPREVPRICE")
+
+        price  = float(row[price_i])  if price_i  is not None and row[price_i]  is not None else 0
+        change = float(row[change_i]) if change_i is not None and row[change_i] is not None else 0
+
+        return {"price": round(price, 2), "change": round(change, 2)}
     except:
-        pass
-    return {"price": 0, "change": 0}
+        return {"price": 0, "change": 0}
 
 def get_traditional_prices():
     results = {}
@@ -560,6 +586,14 @@ def process_buffer():
 
     line = "------------------------------"
     signals_header = ""
+
+    # Пробои не публикуем в Telegram (решили по итогам 3 недель наблюдений) —
+    # индикатор их по-прежнему считает, просто не шлём в чат
+    SKIP_SIGNALS = ("BREAKOUT_UP", "BREAKOUT_DOWN")
+    signals = [s for s in signals if s.get("signal", "") not in SKIP_SIGNALS]
+
+    if not signals:
+        return
 
     # Определяем топик по первому сигналу
     first = signals[0]
@@ -797,13 +831,14 @@ def telegram_updates():
 
     text      = (msg.get("text") or "").strip()
     thread_id = msg.get("message_thread_id")
+    tf_filter = THREAD_TO_TF.get(thread_id)  # None если тема не привязана к ТФ (например General)
 
     if text.startswith("/stats24h"):
-        send_telegram(format_stats("24 ЧАСА", 24), thread_id)
+        send_telegram(format_stats("24 ЧАСА", 24, tf_filter), thread_id)
     elif text.startswith("/statsweek"):
-        send_telegram(format_stats("НЕДЕЛЯ", 24 * 7), thread_id)
+        send_telegram(format_stats("НЕДЕЛЯ", 24 * 7, tf_filter), thread_id)
     elif text.startswith("/statsmonth"):
-        send_telegram(format_stats("МЕСЯЦ", 24 * 30), thread_id)
+        send_telegram(format_stats("МЕСЯЦ", 24 * 30, tf_filter), thread_id)
 
     return "OK", 200
 
