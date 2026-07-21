@@ -24,6 +24,7 @@ THREAD_12H      = 582                # 12 часов сигналы
 THREAD_1D       = 584                # 1 день сигналы
 THREAD_RU       = 15                 # RU Market
 THREAD_US       = 18                 # US Market
+THREAD_WHALE    = 591                # Whale Alerts
 
 # Таймфреймы → топики (для крипто)
 TF_TO_THREAD = {
@@ -124,6 +125,92 @@ def price_tracker_loop():
         except:
             pass
         time.sleep(PRICE_POLL_SECONDS)
+
+# ═══════════════════════════════════════════════
+# КИТОВЫЕ СДЕЛКИ (Whale Alerts) — через публичный поток сделок Bybit
+# ═══════════════════════════════════════════════
+WHALE_COINS = ["BTC", "FARTCOIN", "ETH", "LINK", "SOL", "DOGE", "PEPE", "APT",
+               "SUI", "HYPE", "WIF", "AVAX", "XLM", "PUMP", "LTC", "XRP",
+               "ARB", "DOT", "ATOM", "WLD", "ONDO", "C98", "TRB", "MONK"]
+WHALE_THRESHOLD_USD = 25000
+WHALE_POLL_SECONDS  = 25
+
+whale_symbol_cache = {}   # coin -> реальный тикер на Bybit (или None если не нашли)
+whale_seen_trades  = {}   # symbol -> set() уже отправленных execId (защита от дублей)
+
+def resolve_whale_symbol(coin):
+    """Пробует несколько вариантов написания тикера на Bybit (обычные монеты
+    и мелкие с приставкой 1000, например 1000PEPEUSDT)."""
+    candidates = [coin + "USDT", "1000" + coin + "USDT", "1000000" + coin + "USDT"]
+    for sym in candidates:
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=" + sym
+            r = requests.get(url, timeout=6).json()
+            lst = r.get("result", {}).get("list", [])
+            if lst:
+                return sym
+        except:
+            continue
+    return None
+
+def get_recent_trades(symbol, limit=50):
+    try:
+        url = "https://api.bybit.com/v5/market/recent-trade?category=linear&symbol=" + symbol + "&limit=" + str(limit)
+        r = requests.get(url, timeout=8).json()
+        return r.get("result", {}).get("list", [])
+    except:
+        return []
+
+def send_whale_alert(coin, side, price, size, value):
+    is_buy = (side or "").lower() == "buy"
+    emoji = "&#128994;" if is_buy else "&#128308;"
+    side_ru = "ПОКУПКА" if is_buy else "ПРОДАЖА"
+    line = "------------------------------"
+    text = (
+        "&#128011; <b>КИТОВАЯ СДЕЛКА — " + coin + "</b>\n"
+        + line + "\n"
+        + emoji + " " + side_ru + ": $" + "{:,.0f}".format(value) + "\n"
+        + "Цена: $" + "{:.6g}".format(price) + "\n"
+        + "Объём: " + "{:.4g}".format(size) + " " + coin + "\n"
+        + line + "\n"
+        + "<i>Usoltsev Signals</i>"
+    )
+    send_telegram(text, THREAD_WHALE)
+
+def whale_tracker_loop():
+    """Фоновый поток: опрашивает последние сделки по списку монет,
+    шлёт алерт если одна сделка превышает WHALE_THRESHOLD_USD."""
+    # один раз находим реальные тикеры Bybit для каждой монеты
+    for coin in WHALE_COINS:
+        whale_symbol_cache[coin] = resolve_whale_symbol(coin)
+        time.sleep(0.3)
+
+    while True:
+        try:
+            for coin in WHALE_COINS:
+                sym = whale_symbol_cache.get(coin)
+                if not sym:
+                    continue
+                trades = get_recent_trades(sym)
+                seen = whale_seen_trades.setdefault(sym, set())
+                for t in trades:
+                    exec_id = t.get("execId") or t.get("i")
+                    if not exec_id or exec_id in seen:
+                        continue
+                    seen.add(exec_id)
+                    try:
+                        price = float(t.get("price", 0))
+                        size  = float(t.get("size", 0))
+                    except:
+                        continue
+                    value = price * size
+                    if value >= WHALE_THRESHOLD_USD:
+                        send_whale_alert(coin, t.get("side", ""), price, size, value)
+                if len(seen) > 500:
+                    whale_seen_trades[sym] = set(list(seen)[-250:])
+        except:
+            pass
+        time.sleep(WHALE_POLL_SECONDS)
 
 trades_lock = threading.Lock()
 
@@ -789,6 +876,11 @@ def test_signal():
     process_buffer()
     return "Тестовый сигнал отправлен!", 200
 
+@app.route("/test_whale")
+def test_whale():
+    send_whale_alert("BTC", "Buy", 65000, 1.5, 97500)
+    return "Тестовый китовый алерт отправлен!", 200
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global signal_buffer, buffer_timer
@@ -862,6 +954,10 @@ scheduler.start()
 # Фоновый поток отслеживания цен Bybit
 price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
 price_thread.start()
+
+# Фоновый поток отслеживания китовых сделок
+whale_thread = threading.Thread(target=whale_tracker_loop, daemon=True)
+whale_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
