@@ -1,5 +1,3 @@
-
-Main · PY
 from flask import Flask, request
 import requests
 import os
@@ -9,12 +7,12 @@ import json
 import xml.etree.ElementTree as ET
 import threading
 import time
- 
+
 app = Flask(__name__)
- 
+
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
- 
+
 # ═══════════════════════════════════════════════
 # CHAT ID и THREAD ID
 # ═══════════════════════════════════════════════
@@ -27,7 +25,7 @@ THREAD_1D       = 584                # 1 день сигналы
 THREAD_RU       = 15                 # RU Market
 THREAD_US       = 18                 # US Market
 THREAD_WHALE    = 591                # Whale Alerts
- 
+
 # Таймфреймы → топики (для крипто)
 TF_TO_THREAD = {
     "60":  THREAD_1H,
@@ -35,7 +33,7 @@ TF_TO_THREAD = {
     "720": THREAD_12H,
     "D":   THREAD_1D,
 }
- 
+
 # Явная связка thread_id -> tf-ключ (как в TF_TO_THREAD), нужна чтобы фильтровать closed_trades по tf
 THREAD_TO_TF = {
     THREAD_1H:  "60",
@@ -44,12 +42,12 @@ THREAD_TO_TF = {
     THREAD_1D:  "D",
 }
 TF_LABEL = {"60": "1ч", "240": "4ч", "720": "12ч", "D": "1д"}
- 
+
 signal_buffer = []
 buffer_lock = threading.Lock()
 buffer_timer = None
 BUFFER_SECONDS = 60
- 
+
 # ═══════════════════════════════════════════════
 # ИСТОРИЯ СДЕЛОК И СТАТИСТИКА
 # ═══════════════════════════════════════════════
@@ -57,19 +55,19 @@ TRADES_FILE = "trades.json"
 DEPOSIT     = 100.0
 LEVERAGE    = 50
 BYBIT_FEE_PCT = 0.055   # средняя комиссия тейкера Bybit за одну сторону сделки, %
- 
+
 # Отслеживание цен: порог хода в плюс, после которого считаем
 # что стоп был передвинут в безубыток, %
 BREAKEVEN_THRESHOLD_PCT = 0.3
 PRICE_POLL_SECONDS = 45   # период опроса цен Bybit
- 
+
 def to_bybit_symbol(ticker):
     """FARTCOINUSDT.P -> FARTCOINUSDT, BTCUSD -> BTCUSDT"""
     t = ticker.upper().replace(".P", "")
     if not t.endswith("USDT") and t.endswith("USD"):
         t = t[:-3] + "USDT"
     return t
- 
+
 def get_bybit_price(symbol):
     try:
         url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=" + symbol
@@ -80,7 +78,7 @@ def get_bybit_price(symbol):
     except:
         pass
     return None
- 
+
 def price_tracker_loop():
     """Фоновый поток: обновляет max_price/min_price по всем открытым позициям."""
     while True:
@@ -88,20 +86,20 @@ def price_tracker_loop():
             with trades_lock:
                 data = load_trades_data()
                 positions = dict(data.get("open_positions", {}))
- 
+
             if positions:
                 # Уникальные тикеры
                 tickers = {}
                 for pos_key, pos in positions.items():
                     tk = pos_key.rsplit("_", 1)[0]
                     tickers.setdefault(tk, []).append(pos_key)
- 
+
                 prices = {}
                 for tk in tickers:
                     p = get_bybit_price(to_bybit_symbol(tk))
                     if p is not None:
                         prices[tk] = p
- 
+
                 if prices:
                     with trades_lock:
                         data = load_trades_data()
@@ -127,7 +125,7 @@ def price_tracker_loop():
         except:
             pass
         time.sleep(PRICE_POLL_SECONDS)
- 
+
 # ═══════════════════════════════════════════════
 # КИТОВЫЕ СДЕЛКИ (Whale Alerts) — через публичный поток сделок Bybit
 # ═══════════════════════════════════════════════
@@ -136,10 +134,10 @@ WHALE_COINS = ["BTC", "FARTCOIN", "ETH", "LINK", "SOL", "DOGE", "PEPE", "APT",
                "ARB", "DOT", "ATOM", "WLD", "ONDO", "C98", "TRB", "MONK"]
 WHALE_THRESHOLD_USD = 25000
 WHALE_POLL_SECONDS  = 25
- 
+
 whale_symbol_cache = {}   # coin -> реальный тикер на Bybit (или None если не нашли)
 whale_seen_trades  = {}   # symbol -> set() уже отправленных execId (защита от дублей)
- 
+
 def resolve_whale_symbol(coin):
     """Пробует несколько вариантов написания тикера на Bybit (обычные монеты
     и мелкие с приставкой 1000, например 1000PEPEUSDT)."""
@@ -154,7 +152,7 @@ def resolve_whale_symbol(coin):
         except:
             continue
     return None
- 
+
 def get_recent_trades(symbol, limit=50):
     try:
         url = "https://api.bybit.com/v5/market/recent-trade?category=linear&symbol=" + symbol + "&limit=" + str(limit)
@@ -162,11 +160,11 @@ def get_recent_trades(symbol, limit=50):
         return r.get("result", {}).get("list", [])
     except:
         return []
- 
+
 # Буфер для группировки китовых алертов (биржевых и ончейн) — отправляем одной сводкой раз в 30 минут
 whale_alert_lock = threading.Lock()
 whale_alert_buffer = []   # список строк-записей на отправку
- 
+
 def send_whale_alert(coin, side, price, size, value):
     is_buy = (side or "").lower() == "buy"
     emoji = "&#128994;" if is_buy else "&#128308;"
@@ -178,7 +176,7 @@ def send_whale_alert(coin, side, price, size, value):
     )
     with whale_alert_lock:
         whale_alert_buffer.append(entry)
- 
+
 def whale_tracker_loop():
     """Фоновый поток: опрашивает последние сделки по списку монет,
     шлёт алерт если одна сделка превышает WHALE_THRESHOLD_USD."""
@@ -186,7 +184,7 @@ def whale_tracker_loop():
     for coin in WHALE_COINS:
         whale_symbol_cache[coin] = resolve_whale_symbol(coin)
         time.sleep(0.3)
- 
+
     while True:
         try:
             for coin in WHALE_COINS:
@@ -213,9 +211,9 @@ def whale_tracker_loop():
         except:
             pass
         time.sleep(WHALE_POLL_SECONDS)
- 
+
 trades_lock = threading.Lock()
- 
+
 def load_trades_data():
     if os.path.exists(TRADES_FILE):
         try:
@@ -224,20 +222,20 @@ def load_trades_data():
         except:
             pass
     return {"start_date": None, "open_positions": {}, "closed_trades": []}
- 
+
 def save_trades_data(data):
     try:
         with open(TRADES_FILE, "w") as f:
             json.dump(data, f)
     except:
         pass
- 
+
 def f_price(p):
     try:
         return float(p)
     except:
         return None
- 
+
 def process_trade_signal(ticker, sig, price, tf="60"):
     """Обрабатывает LONG/SHORT сигнал: закрывает предыдущую позицию по тикеру+таймфрейму
     (если была) и открывает новую. Позиции 5м и 15м по одному тикеру независимы.
@@ -247,17 +245,17 @@ def process_trade_signal(ticker, sig, price, tf="60"):
     price_val = f_price(price)
     if price_val is None:
         return None
- 
+
     pos_key = ticker + "_" + str(tf)
- 
+
     with trades_lock:
         data = load_trades_data()
         if data["start_date"] is None:
             data["start_date"] = datetime.now().strftime("%d.%m.%Y")
- 
+
         compare_text = None
         prev = data["open_positions"].get(pos_key)
- 
+
         if prev is not None:
             prev_sig   = prev.get("signal")
             prev_price = prev.get("price")
@@ -267,12 +265,12 @@ def process_trade_signal(ticker, sig, price, tf="60"):
                     pnl_pct = change_pct
                 else:
                     pnl_pct = -change_pct
- 
+
                 position_size = DEPOSIT * LEVERAGE
                 fee_usd = position_size * (BYBIT_FEE_PCT / 100) * 2   # вход + выход
                 is_same_direction = (prev_sig == sig)
                 breakeven_note = ""
- 
+
                 # Реальный максимальный ход в пользу позиции (из отслеживания цен)
                 mx = prev.get("max_price", prev_price)
                 mn = prev.get("min_price", prev_price)
@@ -280,7 +278,7 @@ def process_trade_signal(ticker, sig, price, tf="60"):
                     favorable_pct = (mx - prev_price) / prev_price * 100
                 else:
                     favorable_pct = (prev_price - mn) / prev_price * 100
- 
+
                 if is_same_direction and favorable_pct >= BREAKEVEN_THRESHOLD_PCT:
                     # Цена реально ходила в плюс >= порога — стоп был в безубытке
                     pnl_usd = -fee_usd
@@ -289,17 +287,17 @@ def process_trade_signal(ticker, sig, price, tf="60"):
                     pnl_usd = position_size * (pnl_pct / 100) - fee_usd
                     if favorable_pct > 0:
                         breakeven_note = " (макс ход +" + "{:.2f}".format(favorable_pct) + "%)"
- 
+
                 result_emoji = "&#9989;" if pnl_usd >= 0 else "&#10060;"
                 reversal = " | &#128260; Разворот" if prev_sig != sig else ""
- 
+
                 compare_text = (
                     "&#8618; Пред: " + ("ЛОНГ" if prev_sig == "LONG" else "ШОРТ")
                     + " $" + str(prev_price)
                     + " (" + "{:+.2f}".format(pnl_pct) + "%, " + "{:+.2f}".format(pnl_usd) + "$ после комиссии" + breakeven_note + ") "
                     + result_emoji + reversal
                 )
- 
+
                 data["closed_trades"].append({
                     "ticker": ticker,
                     "signal": prev_sig,
@@ -313,12 +311,12 @@ def process_trade_signal(ticker, sig, price, tf="60"):
                 # Ограничиваем историю последними 2000 сделками
                 if len(data["closed_trades"]) > 2000:
                     data["closed_trades"] = data["closed_trades"][-2000:]
- 
+
         data["open_positions"][pos_key] = {"signal": sig, "price": price_val, "tf": str(tf), "max_price": price_val, "min_price": price_val, "opened_at": datetime.now().isoformat()}
         save_trades_data(data)
- 
+
     return compare_text
- 
+
 def process_return_signal(ticker, sig, price, tf="60"):
     """Возврат в канал как сигнал ЗАКРЫТИЯ противоположной позиции:
     RETURN_SHORT (импульс вверх выдохся) закрывает открытый LONG,
@@ -330,27 +328,27 @@ def process_return_signal(ticker, sig, price, tf="60"):
     price_val = f_price(price)
     if price_val is None:
         return None
- 
+
     close_direction = "SHORT" if sig == "RETURN_LONG" else "LONG"
     pos_key = ticker + "_" + str(tf)
- 
+
     with trades_lock:
         data = load_trades_data()
         prev = data["open_positions"].get(pos_key)
         if prev is None or prev.get("signal") != close_direction:
             return None
- 
+
         prev_price = prev.get("price")
         if not prev_price:
             return None
- 
+
         change_pct = (price_val - prev_price) / prev_price * 100
         pnl_pct = change_pct if close_direction == "LONG" else -change_pct
- 
+
         position_size = DEPOSIT * LEVERAGE
         fee_usd = position_size * (BYBIT_FEE_PCT / 100) * 2
         pnl_usd = position_size * (pnl_pct / 100) - fee_usd
- 
+
         result_emoji = "&#9989;" if pnl_usd >= 0 else "&#10060;"
         compare_text = (
             "&#128274; Закрыт " + ("ЛОНГ" if close_direction == "LONG" else "ШОРТ")
@@ -358,7 +356,7 @@ def process_return_signal(ticker, sig, price, tf="60"):
             + " (" + "{:+.2f}".format(pnl_pct) + "%, " + "{:+.2f}".format(pnl_usd) + "$ после комиссии) "
             + result_emoji
         )
- 
+
         data["closed_trades"].append({
             "ticker": ticker,
             "signal": close_direction,
@@ -372,18 +370,18 @@ def process_return_signal(ticker, sig, price, tf="60"):
         })
         if len(data["closed_trades"]) > 2000:
             data["closed_trades"] = data["closed_trades"][-2000:]
- 
+
         del data["open_positions"][pos_key]
         save_trades_data(data)
- 
+
     return compare_text
- 
+
 def calc_stats(period_hours, tf_filter=None):
     with trades_lock:
         data = load_trades_data()
     trades = data.get("closed_trades", [])
     start_date = data.get("start_date", "—")
- 
+
     cutoff = datetime.now().timestamp() - period_hours * 3600
     filtered = []
     for t in trades:
@@ -396,19 +394,19 @@ def calc_stats(period_hours, tf_filter=None):
             filtered.append(t)
         except:
             continue
- 
+
     total = len(filtered)
     wins  = sum(1 for t in filtered if t["pnl_usd"] >= 0)
     losses = total - wins
     winrate = (wins / total * 100) if total > 0 else 0
     total_pnl = sum(t["pnl_usd"] for t in filtered)
- 
+
     ret_trades = [t for t in filtered if t.get("closed_by") == "return"]
     ret_total  = len(ret_trades)
     ret_wins   = sum(1 for t in ret_trades if t["pnl_usd"] >= 0)
     ret_winrate = (ret_wins / ret_total * 100) if ret_total > 0 else 0
     ret_pnl    = sum(t["pnl_usd"] for t in ret_trades)
- 
+
     return {
         "total": total,
         "wins": wins,
@@ -420,7 +418,7 @@ def calc_stats(period_hours, tf_filter=None):
         "ret_pnl": ret_pnl,
         "start_date": start_date
     }
- 
+
 def format_stats(period_name, period_hours, tf_filter=None):
     s = calc_stats(period_hours, tf_filter)
     line = "------------------------------"
@@ -441,16 +439,16 @@ def format_stats(period_name, period_hours, tf_filter=None):
         + "<i>Usoltsev Signals</i>"
     )
     return text
- 
+
 # ═══════════════════════════════════════════════
 # ТИКЕРЫ
 # ═══════════════════════════════════════════════
 RUSSIAN_TICKERS = ["LKOH", "SBER", "GAZP", "ROSN", "NVTK", "GMKN", "YNDX",
                    "TATN", "MAGN", "CHMF", "ALRS", "MTSS", "POLY", "PLZL"]
- 
+
 US_TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META",
               "NFLX", "AMD", "INTC", "SPY", "QQQ", "BABA"]
- 
+
 def get_ticker_thread(ticker, tf="60"):
     t = ticker.upper()
     if any(t.startswith(r) for r in RUSSIAN_TICKERS):
@@ -458,7 +456,7 @@ def get_ticker_thread(ticker, tf="60"):
     if any(t.startswith(u) for u in US_TICKERS):
         return THREAD_US
     return TF_TO_THREAD.get(str(tf), THREAD_1H)
- 
+
 # ═══════════════════════════════════════════════
 # КРИПТО ДАННЫЕ
 # ═══════════════════════════════════════════════
@@ -493,7 +491,7 @@ def get_crypto_prices():
     except:
         pass
     return {"price": 0, "change": 0}
- 
+
 def get_btc_dominance():
     try:
         r = requests.get("https://api.coingecko.com/api/v3/global", timeout=10).json()
@@ -501,7 +499,7 @@ def get_btc_dominance():
         return round(r["data"]["market_cap_percentage"]["btc"], 2)
     except:
         return 0
- 
+
 def get_altseason_index():
     try:
         time.sleep(3)
@@ -529,7 +527,7 @@ def get_altseason_index():
         return round(count / total * 100)
     except:
         return None
- 
+
 def get_total3():
     try:
         time.sleep(2)
@@ -542,7 +540,7 @@ def get_total3():
         return {"value": total3, "change": total_change}
     except:
         return {"value": 0, "change": 0}
- 
+
 # ═══════════════════════════════════════════════
 # МАКРО ДАННЫЕ
 # ═══════════════════════════════════════════════
@@ -558,25 +556,25 @@ def get_imoex():
         rows = md.get("data", [])
         if not rows or not cols:
             return {"price": 0, "change": 0}
- 
+
         row = rows[0]
- 
+
         def col_idx(*names):
             for n in names:
                 if n in cols:
                     return cols.index(n)
             return None
- 
+
         price_i  = col_idx("CURRENTVALUE", "LASTVALUE")
         change_i = col_idx("LASTCHANGEPRC", "LASTCHANGEPRCNT", "CHANGE", "LASTTOPREVPRICE")
- 
+
         price  = float(row[price_i])  if price_i  is not None and row[price_i]  is not None else 0
         change = float(row[change_i]) if change_i is not None and row[change_i] is not None else 0
- 
+
         return {"price": round(price, 2), "change": round(change, 2)}
     except:
         return {"price": 0, "change": 0}
- 
+
 def get_traditional_prices():
     results = {}
     pairs = {
@@ -608,7 +606,7 @@ def get_traditional_prices():
         except:
             results[key] = {"price": 0, "change": 0}
     return results
- 
+
 def get_fear_greed():
     try:
         r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()
@@ -617,7 +615,7 @@ def get_fear_greed():
         return value + " - " + label
     except:
         return "N/A"
- 
+
 def get_news():
     sources = [
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -645,7 +643,7 @@ def get_news():
         except:
             continue
     return "\n".join(headlines) if headlines else "Новости временно недоступны"
- 
+
 # ═══════════════════════════════════════════════
 # ОТПРАВКА В TELEGRAM
 # ═══════════════════════════════════════════════
@@ -659,42 +657,42 @@ def send_telegram(text, thread_id=None):
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
     requests.post(url, json=payload)
- 
+
 # ═══════════════════════════════════════════════
 # БУФЕР СИГНАЛОВ
 # ═══════════════════════════════════════════════
 def process_buffer():
     global signal_buffer, buffer_timer
- 
+
     with buffer_lock:
         if not signal_buffer:
             return
         signals = signal_buffer.copy()
         signal_buffer = []
         buffer_timer = None
- 
+
     line = "------------------------------"
     signals_header = ""
- 
+
     # Пробои не публикуем в Telegram (решили по итогам 3 недель наблюдений) —
     # индикатор их по-прежнему считает, просто не шлём в чат
     SKIP_SIGNALS = ("BREAKOUT_UP", "BREAKOUT_DOWN")
     signals = [s for s in signals if s.get("signal", "") not in SKIP_SIGNALS]
- 
+
     if not signals:
         return
- 
+
     # Определяем топик по первому сигналу
     first = signals[0]
     ticker = first.get("ticker", "")
     tf     = str(first.get("tf", "60"))
     thread_id = get_ticker_thread(ticker, tf)
- 
+
     for s in signals:
         sig    = s.get("signal", "")
         ticker = s.get("ticker", "")
         price  = s.get("price", "")
- 
+
         if sig == "LONG":
             emoji    = "&#128994;"   # 🟢
             sig_text = "ЛОНГ"
@@ -716,9 +714,9 @@ def process_buffer():
         else:
             emoji    = "&#9898;"     # ⚪
             sig_text = sig or "СИГНАЛ"
- 
+
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + "\n"
- 
+
         target = s.get("target", "")
         stop   = s.get("stop", "")
         if target and stop:
@@ -731,16 +729,16 @@ def process_buffer():
                 )
             except:
                 pass
- 
+
         sig_tf = str(s.get("tf", "60"))
         compare = process_trade_signal(ticker, sig, price, sig_tf)
         if compare:
             signals_header += compare + "\n"
- 
+
         return_close = process_return_signal(ticker, sig, price, sig_tf)
         if return_close:
             signals_header += return_close + "\n"
- 
+
     signal_count = len(signals)
     if signal_count > 1:
         text = (
@@ -757,7 +755,7 @@ def process_buffer():
             + "<i>Usoltsev Signals</i>"
         )
     send_telegram(text, thread_id)
- 
+
 # ═══════════════════════════════════════════════
 # ФОРМАТИРОВАНИЕ
 # ═══════════════════════════════════════════════
@@ -768,7 +766,7 @@ def format_total3(value):
         return "{:.2f}B".format(value / 1_000_000_000)
     else:
         return "{:.2f}M".format(value / 1_000_000)
- 
+
 def format_altseason(value):
     if value is None:
         return "N/A"
@@ -780,7 +778,7 @@ def format_altseason(value):
         return str(value) + " - Ближе к BTC"
     else:
         return str(value) + " - Сезон BTC"
- 
+
 # ═══════════════════════════════════════════════
 # ДАЙДЖЕСТ
 # ═══════════════════════════════════════════════
@@ -792,10 +790,10 @@ def daily_report():
     trad   = get_traditional_prices()
     fg     = get_fear_greed()
     news   = get_news()
- 
+
     btc_price  = btc.get("price", 0) or 0
     btc_change = btc.get("change", 0) or 0
- 
+
     gold   = trad.get("gold",   {})
     brent  = trad.get("brent",  {})
     dxy    = trad.get("dxy",    {})
@@ -803,7 +801,7 @@ def daily_report():
     aedusd = trad.get("aedusd", {})
     es     = trad.get("es",     {})
     imoex  = get_imoex()
- 
+
     gold_price   = gold.get("price", 0) or 0
     gold_change  = gold.get("change", 0) or 0
     brent_price  = brent.get("price", 0) or 0
@@ -821,7 +819,7 @@ def daily_report():
     rub_aed      = round(rub_price / aed_price, 2) if aed_price > 0 else 0
     total3_val    = total3.get("value", 0) or 0
     total3_change = total3.get("change", 0) or 0
- 
+
     now = datetime.now()
     hour = now.hour
     if hour == 4:
@@ -830,7 +828,7 @@ def daily_report():
         greeting = "&#127774; <b>ДНЕВНОЙ ДАЙДЖЕСТ</b>"
     else:
         greeting = "&#127762; <b>ВЕЧЕРНИЙ ДАЙДЖЕСТ</b>"
- 
+
     line = "------------------------------"
     text = (
         greeting + "\n"
@@ -862,7 +860,7 @@ def daily_report():
         + "<i>Usoltsev Signals</i>"
     )
     send_telegram(text, THREAD_GENERAL)
- 
+
 # ═══════════════════════════════════════════════
 # РОУТЫ
 # ═══════════════════════════════════════════════
@@ -870,36 +868,36 @@ def daily_report():
 def test_morning():
     daily_report()
     return "Дайджест отправлен!", 200
- 
+
 @app.route("/test_signal")
 def test_signal():
     with buffer_lock:
         signal_buffer.append({"signal": "LONG", "ticker": "BTCUSD", "price": "75000", "tf": "60"})
     process_buffer()
     return "Тестовый сигнал отправлен!", 200
- 
+
 @app.route("/test_whale")
 def test_whale():
     send_whale_alert("BTC", "Buy", 65000, 1.5, 97500)
     flush_whale_alerts()
     return "Тестовый китовый алерт отправлен (сводкой)!", 200
- 
+
 @app.route("/test_flush_whale")
 def test_flush_whale():
     """Принудительно сбросить накопленный буфер прямо сейчас, не дожидаясь 30 минут."""
     n = len(whale_alert_buffer)
     flush_whale_alerts()
     return "Сброшено записей: " + str(n), 200
- 
+
 @app.route("/test_onchain")
 def test_onchain():
     """Диагностика: запускает один цикл сканирования сразу и показывает что реально
     произошло (без try/except pass — чтобы увидеть настоящие ошибки, если они есть)."""
     report = {}
- 
+
     report["etherscan_key_set"] = bool(ETHERSCAN_API_KEY)
     report["solscan_key_set"] = bool(SOLSCAN_API_KEY)
- 
+
     try:
         refresh_onchain_universe()
         report["universe_eth_count"] = len(onchain_universe.get("eth", {}))
@@ -908,7 +906,7 @@ def test_onchain():
         report["universe_sol_sample"] = list(onchain_universe.get("sol", {}).items())[:3]
     except Exception as e:
         report["universe_error"] = str(e)
- 
+
     # Пробуем один реальный запрос к Etherscan (WBTC — стабильный, всегда есть в FIXED_ETH_TOKENS)
     try:
         wbtc_addr, wbtc_dec = FIXED_ETH_TOKENS["WBTC"]
@@ -922,7 +920,7 @@ def test_onchain():
         report["etherscan_test_result_sample"] = result[:1] if isinstance(result, list) else result
     except Exception as e:
         report["etherscan_test_error"] = str(e)
- 
+
     # Пробуем один реальный запрос к Solscan
     try:
         sol_sample = list(onchain_universe.get("sol", {}).items())
@@ -938,13 +936,13 @@ def test_onchain():
             report["solscan_test_note"] = "нет ни одного Solana-токена в universe для теста"
     except Exception as e:
         report["solscan_test_error"] = str(e)
- 
+
     return json.dumps(report, indent=2, ensure_ascii=False, default=str), 200, {"Content-Type": "application/json; charset=utf-8"}
- 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global signal_buffer, buffer_timer
- 
+
     try:
         if request.content_type and "application/json" in request.content_type:
             data = request.json or {}
@@ -956,7 +954,7 @@ def webhook():
                 data = {"signal": raw, "ticker": "", "price": "", "tf": "60"}
     except:
         data = {}
- 
+
     with buffer_lock:
         signal_buffer.append(data)
         if buffer_timer is None:
@@ -964,9 +962,9 @@ def webhook():
             t.daemon = True
             t.start()
             buffer_timer = t
- 
+
     return "OK", 200
- 
+
 # ═══════════════════════════════════════════════
 # TELEGRAM BOT COMMANDS (webhook на входящие сообщения)
 # ═══════════════════════════════════════════════
@@ -976,35 +974,35 @@ def telegram_updates():
         update = request.json or {}
     except:
         update = {}
- 
+
     msg = update.get("message") or update.get("channel_post")
     if not msg:
         return "OK", 200
- 
+
     text      = (msg.get("text") or "").strip()
     thread_id = msg.get("message_thread_id")
     tf_filter = THREAD_TO_TF.get(thread_id)  # None если тема не привязана к ТФ (например General)
- 
+
     if text.startswith("/stats24h"):
         send_telegram(format_stats("24 ЧАСА", 24, tf_filter), thread_id)
     elif text.startswith("/statsweek"):
         send_telegram(format_stats("НЕДЕЛЯ", 24 * 7, tf_filter), thread_id)
     elif text.startswith("/statsmonth"):
         send_telegram(format_stats("МЕСЯЦ", 24 * 30, tf_filter), thread_id)
- 
+
     return "OK", 200
- 
+
 @app.route("/set_telegram_webhook")
 def set_telegram_webhook():
     webhook_url = "https://usoltsev-webhook-production.up.railway.app/telegram_updates"
     tg_url = "https://api.telegram.org/bot" + BOT_TOKEN + "/setWebhook"
     r = requests.post(tg_url, json={"url": webhook_url})
     return r.text, 200
- 
+
 @app.route("/")
 def index():
     return "Webhook работает!", 200
- 
+
 def flush_whale_alerts():
     """Раз в 30 минут: собираем всё что накопилось в буфере в одну сводку и шлём одним сообщением."""
     with whale_alert_lock:
@@ -1012,7 +1010,7 @@ def flush_whale_alerts():
             return
         entries = whale_alert_buffer.copy()
         whale_alert_buffer.clear()
- 
+
     line = "------------------------------"
     text = (
         "&#128011; <b>КИТОВАЯ СВОДКА</b> (" + str(len(entries)) + " " + ("событие" if len(entries) == 1 else "событий") + " за 30 мин)\n"
@@ -1022,30 +1020,30 @@ def flush_whale_alerts():
         + "<i>Usoltsev Signals</i>"
     )
     send_telegram(text, THREAD_WHALE)
- 
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(daily_report, "cron", hour=4,  minute=0)
 scheduler.add_job(daily_report, "cron", hour=10, minute=0)
 scheduler.add_job(daily_report, "cron", hour=14, minute=0)
 scheduler.add_job(flush_whale_alerts, "interval", minutes=30)
 scheduler.start()
- 
+
 # ═══════════════════════════════════════════════
 # ОНЧЕЙН КИТЫ (спотовые закупки, Ethereum + Solana)
 # ═══════════════════════════════════════════════
 ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
 SOLSCAN_API_KEY   = os.environ.get("SOLSCAN_API_KEY")
 # Онлайн-киты идут в ту же тему, что и биржевые киты — THREAD_WHALE (591), уже объявлена выше
- 
+
 ONCHAIN_USD_THRESHOLD        = 50000
 ONCHAIN_TOP_N                = 120     # сколько топ-монет по объёму брать с CoinGecko
 ONCHAIN_UNIVERSE_REFRESH_SEC = 3600    # как часто обновлять список топ-монет
 ONCHAIN_POLL_SEC             = 180     # как часто сканировать на предмет крупных переводов
- 
+
 ETH_CHAIN_ID  = 1
 AVAX_CHAIN_ID = 43114
 HYPE_CHAIN_ID = 999
- 
+
 # Фиксированные токены, которые мы уже торгуем — добавлены всегда, независимо от топ-N
 FIXED_ETH_TOKENS = {
     # symbol: (contract_address, decimals)
@@ -1058,7 +1056,7 @@ FIXED_ETH_TOKENS = {
     "C98":  ("0xaec945e04baf28b135fa7c640f624f8d90f1c3a6", 18),
     "WBTC": ("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", 8),
 }
- 
+
 # Известные адреса крупных бирж — НАМЕРЕННО короткий список, только те что уверенно проверены.
 # Расширять только реально сверенными адресами (например через label на Etherscan/Solscan),
 # неправильный адрес тут исказит сигнал купли/продажи.
@@ -1066,10 +1064,10 @@ KNOWN_EXCHANGE_ETH = {
     "0x28c6c06298d514db089934071355e5743bf21d60": "Binance",
 }
 KNOWN_EXCHANGE_SOL = {}   # пока пусто — добавим когда появятся проверенные адреса
- 
+
 onchain_universe = {"eth": {}, "sol": {}, "updated": 0}   # symbol -> {"contract":.., "decimals":.., "price":..}
 onchain_seen = set()   # уже отправленные tx hash, с капом
- 
+
 def refresh_onchain_universe():
     """Раз в час: топ-N монет по объёму с CoinGecko + их адреса контрактов на Ethereum/Solana.
     Фильтруем мусорные/накрученные токены (нулевая или отсутствующая капитализация,
@@ -1090,16 +1088,16 @@ def refresh_onchain_universe():
             stablecoin_ids = {c.get("id") for c in cat_coins if c.get("id")}
     except:
         pass
- 
+
     try:
         list_url = "https://api.coingecko.com/api/v3/coins/list?include_platform=true"
         platforms = requests.get(list_url, timeout=20).json()
         plat_by_id = {c["id"]: c.get("platforms", {}) for c in platforms if "id" in c}
- 
+
         mkt_url = ("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd"
                    "&order=volume_desc&per_page=" + str(ONCHAIN_TOP_N) + "&page=1")
         markets = requests.get(mkt_url, timeout=20).json()
- 
+
         eth_map = {}
         sol_map = {}
         for coin in markets:
@@ -1108,7 +1106,7 @@ def refresh_onchain_universe():
             market_cap = coin.get("market_cap", 0) or 0
             circ_supply = coin.get("circulating_supply", 0) or 0
             symbol = (coin.get("symbol") or "").upper()
- 
+
             # отсекаем мусорные/накрученные токены: нет реальной капитализации
             # или нулевое циркулирующее предложение (типичный признак фейкового объёма)
             if market_cap < MIN_MARKET_CAP or circ_supply <= 0:
@@ -1116,7 +1114,7 @@ def refresh_onchain_universe():
             # отсекаем стейблкоины — по категории CoinGecko (основной способ) + список тикеров (запасной)
             if cid in stablecoin_ids or symbol in STABLECOINS:
                 continue
- 
+
             plats = plat_by_id.get(cid, {})
             eth_addr = plats.get("ethereum")
             sol_addr = plats.get("solana")
@@ -1124,18 +1122,18 @@ def refresh_onchain_universe():
                 eth_map[symbol] = {"contract": eth_addr.lower(), "price": price}
             if sol_addr:
                 sol_map[symbol] = {"contract": sol_addr, "price": price}
- 
+
         # добавляем фиксированные токены (цену возьмём отдельно при сканировании, если не нашлась выше)
         for sym, (addr, dec) in FIXED_ETH_TOKENS.items():
             if sym not in eth_map:
                 eth_map[sym] = {"contract": addr, "price": 0}
- 
+
         onchain_universe["eth"] = eth_map
         onchain_universe["sol"] = sol_map
         onchain_universe["updated"] = time.time()
     except:
         pass
- 
+
 def get_token_price_fallback(symbol):
     try:
         url = "https://api.coingecko.com/api/v3/simple/price?ids=" + symbol.lower() + "&vs_currencies=usd"
@@ -1145,18 +1143,18 @@ def get_token_price_fallback(symbol):
     except:
         pass
     return 0
- 
+
 def send_onchain_alert(symbol, chain_name, tx_hash, amount, usd_value, from_addr, to_addr):
     from_tag = KNOWN_EXCHANGE_ETH.get(from_addr, KNOWN_EXCHANGE_SOL.get(from_addr, ""))
     to_tag   = KNOWN_EXCHANGE_ETH.get(to_addr,   KNOWN_EXCHANGE_SOL.get(to_addr, ""))
- 
+
     if to_tag:
         direction = "&#128308; на " + to_tag + " (возможна продажа)"
     elif from_tag:
         direction = "&#128994; с " + from_tag + " (возможное накопление)"
     else:
         direction = "&#9898; кошелёк ↔ кошелёк"
- 
+
     entry = (
         "&#128011; <b>" + symbol + "</b> (" + chain_name + ") "
         + direction + ": $" + "{:,.0f}".format(usd_value)
@@ -1164,7 +1162,7 @@ def send_onchain_alert(symbol, chain_name, tx_hash, amount, usd_value, from_addr
     )
     with whale_alert_lock:
         whale_alert_buffer.append(entry)
- 
+
 def scan_eth_token(symbol, contract, chainid=ETH_CHAIN_ID, price=0):
     if not ETHERSCAN_API_KEY:
         return
@@ -1196,7 +1194,7 @@ def scan_eth_token(symbol, contract, chainid=ETH_CHAIN_ID, price=0):
                                     (row.get("from") or "").lower(), (row.get("to") or "").lower())
     except:
         pass
- 
+
 def scan_sol_token(symbol, mint, price=0):
     if not SOLSCAN_API_KEY:
         return
@@ -1225,7 +1223,7 @@ def scan_sol_token(symbol, mint, price=0):
                                     row.get("from_address", ""), row.get("to_address", ""))
     except:
         pass
- 
+
 def scan_known_exchange_native(chainid, chain_name, symbol):
     """Для нативных монет (ETH/AVAX/HYPE) — только известные адреса бирж, а не вся сеть."""
     if not ETHERSCAN_API_KEY or not KNOWN_EXCHANGE_ETH:
@@ -1257,7 +1255,7 @@ def scan_known_exchange_native(chainid, chain_name, symbol):
                                         (row.get("from") or "").lower(), (row.get("to") or "").lower())
         except:
             continue
- 
+
 def onchain_whale_loop():
     refresh_onchain_universe()
     last_universe_refresh = time.time()
@@ -1266,37 +1264,36 @@ def onchain_whale_loop():
             if time.time() - last_universe_refresh >= ONCHAIN_UNIVERSE_REFRESH_SEC:
                 refresh_onchain_universe()
                 last_universe_refresh = time.time()
- 
+
             for sym, info in list(onchain_universe.get("eth", {}).items()):
                 scan_eth_token(sym, info["contract"], ETH_CHAIN_ID, info.get("price", 0))
- 
+
             for sym, info in list(onchain_universe.get("sol", {}).items()):
                 scan_sol_token(sym, info["contract"], info.get("price", 0))
- 
+
             scan_known_exchange_native(ETH_CHAIN_ID, "ETH", "ETH")
             scan_known_exchange_native(AVAX_CHAIN_ID, "AVAX", "AVAX")
             scan_known_exchange_native(HYPE_CHAIN_ID, "HYPE", "HYPE")
- 
+
             # ограничиваем множество уже отправленных tx, чтобы не росло бесконечно
             if len(onchain_seen) > 5000:
                 onchain_seen.clear()
         except:
             pass
         time.sleep(ONCHAIN_POLL_SEC)
- 
+
 # Фоновый поток отслеживания цен Bybit
 price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
 price_thread.start()
- 
+
 # Фоновый поток отслеживания китовых сделок (крупные сделки на бирже)
 whale_thread = threading.Thread(target=whale_tracker_loop, daemon=True)
 whale_thread.start()
- 
+
 # Фоновый поток ончейн-китов (спотовые закупки Ethereum + Solana)
 onchain_thread = threading.Thread(target=onchain_whale_loop, daemon=True)
 onchain_thread.start()
- 
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
- 
