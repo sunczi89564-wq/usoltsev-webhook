@@ -951,13 +951,244 @@ scheduler.add_job(daily_report, "cron", hour=10, minute=0)
 scheduler.add_job(daily_report, "cron", hour=14, minute=0)
 scheduler.start()
 
+# ═══════════════════════════════════════════════
+# ОНЧЕЙН КИТЫ (спотовые закупки, Ethereum + Solana)
+# ═══════════════════════════════════════════════
+ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
+SOLSCAN_API_KEY   = os.environ.get("SOLSCAN_API_KEY")
+# Онлайн-киты идут в ту же тему, что и биржевые киты — THREAD_WHALE (591), уже объявлена выше
+
+ONCHAIN_USD_THRESHOLD        = 50000
+ONCHAIN_TOP_N                = 120     # сколько топ-монет по объёму брать с CoinGecko
+ONCHAIN_UNIVERSE_REFRESH_SEC = 3600    # как часто обновлять список топ-монет
+ONCHAIN_POLL_SEC             = 180     # как часто сканировать на предмет крупных переводов
+
+ETH_CHAIN_ID  = 1
+AVAX_CHAIN_ID = 43114
+HYPE_CHAIN_ID = 999
+
+# Фиксированные токены, которые мы уже торгуем — добавлены всегда, независимо от топ-N
+FIXED_ETH_TOKENS = {
+    # symbol: (contract_address, decimals)
+    "LINK": ("0x514910771af9ca656af840dff83e8264ecf986ca", 18),
+    "PEPE": ("0x6982508145454ce325ddbe47a25d4ec3d2311933", 18),
+    "ARB":  ("0xb50721bcf8d664c30412cfbc6cf7a15145234ad1", 18),
+    "WLD":  ("0x163f8c2467924be0ae7b5347228d17d92f5cfffd", 18),
+    "ONDO": ("0xfaba6f8e4a5e8ab82f62fe7c39859fa577269be3", 18),
+    "TRB":  ("0x88df592f8eb5d7bd38bfef7deb0fbc02cf3778a0", 18),
+    "C98":  ("0xaec945e04baf28b135fa7c640f624f8d90f1c3a6", 18),
+    "WBTC": ("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", 8),
+}
+
+# Известные адреса крупных бирж — НАМЕРЕННО короткий список, только те что уверенно проверены.
+# Расширять только реально сверенными адресами (например через label на Etherscan/Solscan),
+# неправильный адрес тут исказит сигнал купли/продажи.
+KNOWN_EXCHANGE_ETH = {
+    "0x28c6c06298d514db089934071355e5743bf21d60": "Binance",
+}
+KNOWN_EXCHANGE_SOL = {}   # пока пусто — добавим когда появятся проверенные адреса
+
+onchain_universe = {"eth": {}, "sol": {}, "updated": 0}   # symbol -> {"contract":.., "decimals":.., "price":..}
+onchain_seen = set()   # уже отправленные tx hash, с капом
+
+def refresh_onchain_universe():
+    """Раз в час: топ-N монет по объёму с CoinGecko + их адреса контрактов на Ethereum/Solana."""
+    try:
+        list_url = "https://api.coingecko.com/api/v3/coins/list?include_platform=true"
+        platforms = requests.get(list_url, timeout=20).json()
+        plat_by_id = {c["id"]: c.get("platforms", {}) for c in platforms if "id" in c}
+
+        mkt_url = ("https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd"
+                   "&order=volume_desc&per_page=" + str(ONCHAIN_TOP_N) + "&page=1")
+        markets = requests.get(mkt_url, timeout=20).json()
+
+        eth_map = {}
+        sol_map = {}
+        for coin in markets:
+            cid = coin.get("id")
+            price = coin.get("current_price", 0) or 0
+            plats = plat_by_id.get(cid, {})
+            symbol = (coin.get("symbol") or "").upper()
+            eth_addr = plats.get("ethereum")
+            sol_addr = plats.get("solana")
+            if eth_addr:
+                eth_map[symbol] = {"contract": eth_addr.lower(), "price": price}
+            if sol_addr:
+                sol_map[symbol] = {"contract": sol_addr, "price": price}
+
+        # добавляем фиксированные токены (цену возьмём отдельно при сканировании, если не нашлась выше)
+        for sym, (addr, dec) in FIXED_ETH_TOKENS.items():
+            if sym not in eth_map:
+                eth_map[sym] = {"contract": addr, "price": 0}
+
+        onchain_universe["eth"] = eth_map
+        onchain_universe["sol"] = sol_map
+        onchain_universe["updated"] = time.time()
+    except:
+        pass
+
+def get_token_price_fallback(symbol):
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=" + symbol.lower() + "&vs_currencies=usd"
+        r = requests.get(url, timeout=8).json()
+        for v in r.values():
+            return v.get("usd", 0)
+    except:
+        pass
+    return 0
+
+def send_onchain_alert(symbol, chain_name, tx_hash, amount, usd_value, from_addr, to_addr):
+    from_tag = KNOWN_EXCHANGE_ETH.get(from_addr, KNOWN_EXCHANGE_SOL.get(from_addr, ""))
+    to_tag   = KNOWN_EXCHANGE_ETH.get(to_addr,   KNOWN_EXCHANGE_SOL.get(to_addr, ""))
+
+    if to_tag:
+        direction = "&#128308; На биржу (" + to_tag + ") — возможна продажа"
+    elif from_tag:
+        direction = "&#128994; С биржи (" + from_tag + ") — возможное накопление"
+    else:
+        direction = "&#9898; Кошелёк ↔ кошелёк (биржа не определена)"
+
+    line = "------------------------------"
+    text = (
+        "&#128011; <b>ОНЧЕЙН КИТ — " + symbol + "</b> (" + chain_name + ")\n"
+        + line + "\n"
+        + "Сумма: $" + "{:,.0f}".format(usd_value) + "  (" + "{:.4g}".format(amount) + " " + symbol + ")\n"
+        + direction + "\n"
+        + line + "\n"
+        + "<i>Usoltsev Signals</i>"
+    )
+    send_telegram(text, THREAD_WHALE)
+
+def scan_eth_token(symbol, contract, chainid=ETH_CHAIN_ID, price=0):
+    if not ETHERSCAN_API_KEY:
+        return
+    try:
+        url = ("https://api.etherscan.io/v2/api?chainid=" + str(chainid)
+               + "&module=account&action=tokentx&contractaddress=" + contract
+               + "&sort=desc&page=1&offset=20&apikey=" + ETHERSCAN_API_KEY)
+        r = requests.get(url, timeout=10).json()
+        rows = r.get("result", [])
+        if not isinstance(rows, list):
+            return
+        px = price if price and price > 0 else get_token_price_fallback(symbol)
+        if not px:
+            return
+        for row in rows:
+            tx_hash = row.get("hash")
+            if not tx_hash or tx_hash in onchain_seen:
+                continue
+            try:
+                dec = int(row.get("tokenDecimal", 18))
+                raw_val = float(row.get("value", 0))
+                amount = raw_val / (10 ** dec)
+            except:
+                continue
+            usd_value = amount * px
+            if usd_value >= ONCHAIN_USD_THRESHOLD:
+                onchain_seen.add(tx_hash)
+                send_onchain_alert(symbol, "ETH", tx_hash, amount, usd_value,
+                                    (row.get("from") or "").lower(), (row.get("to") or "").lower())
+    except:
+        pass
+
+def scan_sol_token(symbol, mint, price=0):
+    if not SOLSCAN_API_KEY:
+        return
+    try:
+        url = "https://pro-api.solscan.io/v2.0/token/transfer?address=" + mint + "&page=1&page_size=20&sort_by=block_time&sort_order=desc"
+        headers = {"token": SOLSCAN_API_KEY}
+        r = requests.get(url, headers=headers, timeout=10).json()
+        rows = r.get("data", [])
+        if not isinstance(rows, list):
+            return
+        px = price if price and price > 0 else get_token_price_fallback(symbol)
+        if not px:
+            return
+        for row in rows:
+            tx_hash = row.get("trans_id") or row.get("tx_hash")
+            if not tx_hash or tx_hash in onchain_seen:
+                continue
+            try:
+                amount = float(row.get("amount", 0)) / (10 ** int(row.get("token_decimal", 0)))
+            except:
+                continue
+            usd_value = amount * px
+            if usd_value >= ONCHAIN_USD_THRESHOLD:
+                onchain_seen.add(tx_hash)
+                send_onchain_alert(symbol, "SOL", tx_hash, amount, usd_value,
+                                    row.get("from_address", ""), row.get("to_address", ""))
+    except:
+        pass
+
+def scan_known_exchange_native(chainid, chain_name, symbol):
+    """Для нативных монет (ETH/AVAX/HYPE) — только известные адреса бирж, а не вся сеть."""
+    if not ETHERSCAN_API_KEY or not KNOWN_EXCHANGE_ETH:
+        return
+    px = get_token_price_fallback(symbol)
+    if not px:
+        return
+    for addr, tag in KNOWN_EXCHANGE_ETH.items():
+        try:
+            url = ("https://api.etherscan.io/v2/api?chainid=" + str(chainid)
+                   + "&module=account&action=txlist&address=" + addr
+                   + "&sort=desc&page=1&offset=10&apikey=" + ETHERSCAN_API_KEY)
+            r = requests.get(url, timeout=10).json()
+            rows = r.get("result", [])
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                tx_hash = row.get("hash")
+                if not tx_hash or tx_hash in onchain_seen:
+                    continue
+                try:
+                    amount = float(row.get("value", 0)) / (10 ** 18)
+                except:
+                    continue
+                usd_value = amount * px
+                if usd_value >= ONCHAIN_USD_THRESHOLD:
+                    onchain_seen.add(tx_hash)
+                    send_onchain_alert(symbol, chain_name, tx_hash, amount, usd_value,
+                                        (row.get("from") or "").lower(), (row.get("to") or "").lower())
+        except:
+            continue
+
+def onchain_whale_loop():
+    refresh_onchain_universe()
+    last_universe_refresh = time.time()
+    while True:
+        try:
+            if time.time() - last_universe_refresh >= ONCHAIN_UNIVERSE_REFRESH_SEC:
+                refresh_onchain_universe()
+                last_universe_refresh = time.time()
+
+            for sym, info in list(onchain_universe.get("eth", {}).items()):
+                scan_eth_token(sym, info["contract"], ETH_CHAIN_ID, info.get("price", 0))
+
+            for sym, info in list(onchain_universe.get("sol", {}).items()):
+                scan_sol_token(sym, info["contract"], info.get("price", 0))
+
+            scan_known_exchange_native(ETH_CHAIN_ID, "ETH", "ETH")
+            scan_known_exchange_native(AVAX_CHAIN_ID, "AVAX", "AVAX")
+            scan_known_exchange_native(HYPE_CHAIN_ID, "HYPE", "HYPE")
+
+            # ограничиваем множество уже отправленных tx, чтобы не росло бесконечно
+            if len(onchain_seen) > 5000:
+                onchain_seen.clear()
+        except:
+            pass
+        time.sleep(ONCHAIN_POLL_SEC)
+
 # Фоновый поток отслеживания цен Bybit
 price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
 price_thread.start()
 
-# Фоновый поток отслеживания китовых сделок
+# Фоновый поток отслеживания китовых сделок (крупные сделки на бирже)
 whale_thread = threading.Thread(target=whale_tracker_loop, daemon=True)
 whale_thread.start()
+
+# Фоновый поток ончейн-китов (спотовые закупки Ethereum + Solana)
+onchain_thread = threading.Thread(target=onchain_whale_loop, daemon=True)
+onchain_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
