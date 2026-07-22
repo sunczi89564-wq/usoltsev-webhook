@@ -881,6 +881,56 @@ def test_whale():
     send_whale_alert("BTC", "Buy", 65000, 1.5, 97500)
     return "Тестовый китовый алерт отправлен!", 200
 
+@app.route("/test_onchain")
+def test_onchain():
+    """Диагностика: запускает один цикл сканирования сразу и показывает что реально
+    произошло (без try/except pass — чтобы увидеть настоящие ошибки, если они есть)."""
+    report = {}
+
+    report["etherscan_key_set"] = bool(ETHERSCAN_API_KEY)
+    report["solscan_key_set"] = bool(SOLSCAN_API_KEY)
+
+    try:
+        refresh_onchain_universe()
+        report["universe_eth_count"] = len(onchain_universe.get("eth", {}))
+        report["universe_sol_count"] = len(onchain_universe.get("sol", {}))
+        report["universe_eth_sample"] = list(onchain_universe.get("eth", {}).items())[:3]
+        report["universe_sol_sample"] = list(onchain_universe.get("sol", {}).items())[:3]
+    except Exception as e:
+        report["universe_error"] = str(e)
+
+    # Пробуем один реальный запрос к Etherscan (WBTC — стабильный, всегда есть в FIXED_ETH_TOKENS)
+    try:
+        wbtc_addr, wbtc_dec = FIXED_ETH_TOKENS["WBTC"]
+        url = ("https://api.etherscan.io/v2/api?chainid=" + str(ETH_CHAIN_ID)
+               + "&module=account&action=tokentx&contractaddress=" + wbtc_addr
+               + "&sort=desc&page=1&offset=3&apikey=" + str(ETHERSCAN_API_KEY))
+        r = requests.get(url, timeout=10).json()
+        report["etherscan_test_status"] = r.get("status")
+        report["etherscan_test_message"] = r.get("message")
+        result = r.get("result")
+        report["etherscan_test_result_sample"] = result[:1] if isinstance(result, list) else result
+    except Exception as e:
+        report["etherscan_test_error"] = str(e)
+
+    # Пробуем один реальный запрос к Solscan
+    try:
+        sol_sample = list(onchain_universe.get("sol", {}).items())
+        if sol_sample:
+            sym, info = sol_sample[0]
+            url = ("https://pro-api.solscan.io/v2.0/token/transfer?address=" + info["contract"]
+                   + "&page=1&page_size=3&sort_by=block_time&sort_order=desc")
+            headers = {"token": SOLSCAN_API_KEY}
+            r = requests.get(url, headers=headers, timeout=10).json()
+            report["solscan_test_symbol"] = sym
+            report["solscan_test_response"] = r
+        else:
+            report["solscan_test_note"] = "нет ни одного Solana-токена в universe для теста"
+    except Exception as e:
+        report["solscan_test_error"] = str(e)
+
+    return json.dumps(report, indent=2, ensure_ascii=False, default=str), 200, {"Content-Type": "application/json; charset=utf-8"}
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global signal_buffer, buffer_timer
