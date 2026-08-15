@@ -1205,12 +1205,29 @@ def webhook():
 # ═══════════════════════════════════════════════
 # TELEGRAM BOT COMMANDS (webhook на входящие сообщения)
 # ═══════════════════════════════════════════════
+# Дедупликация апдейтов Telegram: если webhook не успевает ответить достаточно
+# быстро (например, пока в фоне рисуется график), Telegram может повторно
+# прислать ТОТ ЖЕ update_id — без защиты это приводило к цепочке дублирующихся
+# ответов (в т.ч. дублей "слишком частые запросы"). Небольшой set с капом —
+# этого достаточно, повторы приходят в течение секунд-минут, не часов.
+_seen_update_ids = set()
+_seen_update_ids_lock = threading.Lock()
+
 @app.route("/telegram_updates", methods=["POST"])
 def telegram_updates():
     try:
         update = request.json or {}
     except:
         update = {}
+
+    update_id = update.get("update_id")
+    if update_id is not None:
+        with _seen_update_ids_lock:
+            if update_id in _seen_update_ids:
+                return "OK", 200   # уже обработан — тихо игнорируем повтор
+            _seen_update_ids.add(update_id)
+            if len(_seen_update_ids) > 2000:
+                _seen_update_ids.clear()
 
     msg = update.get("message") or update.get("channel_post")
     if not msg:
@@ -2313,14 +2330,18 @@ TF_CODE_LABEL = {
 
 def parse_analysis_request(text):
     """Парсит свободный текст вида "fartcoinusdt 4h", "HYPE - 4ч", "aapl, 1d" на
-    (тикер_raw, tf_code). Разделитель — пробел/дефис/запятая, регистр не важен.
-    Возвращает None, если не удалось распознать структуру."""
+    (тикер_raw, tf_code). Разделитель — ЛЮБОЙ пробельный символ (включая
+    неразрывный пробел U+00A0 и подобные, которые часто прилетают при копировании
+    с телефона) плюс дефис/запятая, регистр не важен. Возвращает None, если не
+    удалось распознать структуру."""
     if not text:
         return None
     cleaned = text.strip().lower()
-    for sep in ["-", ",", "  "]:
+    for sep in ["-", ",", "\u00a0", "\u200b", "\t"]:
         cleaned = cleaned.replace(sep, " ")
-    parts = [p for p in cleaned.split(" ") if p]
+    # split() без аргумента разбивает по ЛЮБЫМ пробельным символам и схлопывает
+    # повторы — надёжнее, чем split(" ") с ручной фильтрацией пустых элементов
+    parts = cleaned.split()
     if len(parts) < 2:
         return None
     tf_raw = parts[-1]
@@ -2331,6 +2352,14 @@ def parse_analysis_request(text):
     if not ticker_raw or not ticker_raw.isalnum():
         return None
     return ticker_raw.upper(), tf_code
+
+def debug_text_repr(text):
+    """Для диагностики нераспознанных запросов — показывает точный код каждого
+    символа сообщения, чтобы отличить обычный пробел от невидимых символов
+    (неразрывный пробел, zero-width space и т.п.), которые ломают парсинг."""
+    if not text:
+        return "(пустая строка)"
+    return " ".join("U+%04X(%r)" % (ord(ch), ch) for ch in text[:60])
 
 def resolve_symbol_and_category(ticker_raw):
     """Определяет реальный тикер Bybit и category (linear для крипто-перпетуалов,
@@ -2682,7 +2711,9 @@ def run_ask_analysis(raw_text):
 
     parsed = parse_analysis_request(raw_text)
     if not parsed:
-        return False, "Не удалось распознать запрос. Формат: ТИКЕР ТАЙМФРЕЙМ, например 'fartcoinusdt 4h' или 'aapl 1d'"
+        return False, ("Не удалось распознать запрос. Формат: ТИКЕР ТАЙМФРЕЙМ, "
+                        "например 'fartcoinusdt 4h' или 'aapl 1d'.\n"
+                        "Диагностика символов: " + debug_text_repr(raw_text))
 
     ticker_raw, tf_code = parsed
     symbol, category = resolve_symbol_and_category(ticker_raw)
