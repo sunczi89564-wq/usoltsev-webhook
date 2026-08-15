@@ -1082,6 +1082,31 @@ def test_trade_signal():
         "preview": text[:800] if text else None
     }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
+@app.route("/send_ticker_list")
+def send_ticker_list():
+    """Отправляет в тему Ask Analysis столбиком список доступных для запроса
+    тикеров: крипто (WHALE_COINS — те же 24 монеты, что и в whale/volume модулях,
+    в теории можно запросить и любой другой перпетуал Bybit, но эти проверенно
+    резолвятся) отдельной группой, акции xStocks отдельной группой."""
+    lines = []
+    lines.append("&#128203; <b>Доступные тикеры для Ask Analysis</b>")
+    lines.append("------------------------------")
+    lines.append("&#129377; <b>Крипто (Bybit перпетуалы):</b>")
+    for coin in WHALE_COINS:
+        lines.append("• " + coin)
+    lines.append("")
+    lines.append("&#128200; <b>Акции (xStocks, спот):</b>")
+    for stock in sorted(XSTOCKS_TICKERS):
+        lines.append("• " + stock)
+    lines.append("------------------------------")
+    lines.append("<i>Можно запросить и другие крипто-тикеры, которых нет в списке "
+                  "выше — если они торгуются на Bybit как перпетуал, бот попробует "
+                  "их найти автоматически. Формат: ТИКЕР ТАЙМФРЕЙМ, например "
+                  "'fartcoinusdt 4h' или 'aapl 1d'.</i>")
+    text = "\n".join(lines)
+    send_telegram(text, THREAD_ASK_ANALYSIS)
+    return "Список отправлен в тему Ask Analysis", 200
+
 @app.route("/test_ask_analysis")
 def test_ask_analysis():
     """Разовый ручной тест модуля Ask Analysis через query-параметр ?q=,
