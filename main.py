@@ -2362,6 +2362,79 @@ def build_universal_metrics(rows):
         "vol_ratio": vol_ratio, "support": support, "resistance": resistance, "atr": atr,
     }
 
+def find_key_order_blocks(rows, pivot_len=5):
+    """Ищет ОДИН самый значимый (по объёму пивота) неотработанный Order Block
+    с каждой стороны (bullish/bearish). Логика перенесена с Pine-версии:
+    структура рынка определяется по пивотам ЦЕНЫ (highest/lowest за pivot_len),
+    смена структуры вниз после серии хаёв формирует bullish OB на последнем
+    "бычьем" баре перед разворотом, смена вверх после серии лоу — bearish OB.
+    Митигирование: блок считается отработанным, если цена после его формирования
+    уже прошла его целиком (закрытие ниже нижней границы для bullish, выше верхней
+    для bearish) — такие блоки в отбор не попадают."""
+    if len(rows) < pivot_len * 3:
+        return None, None
+
+    highs = [float(r[2]) for r in rows]
+    lows  = [float(r[3]) for r in rows]
+    opens = [float(r[1]) for r in rows]
+    closes = [float(r[4]) for r in rows]
+    vols  = [float(r[5]) for r in rows]
+    n = len(rows)
+
+    candidates_bull = []   # список (top, bottom, volume, bar_idx)
+    candidates_bear = []
+
+    for i in range(pivot_len, n - pivot_len):
+        window_high = max(highs[i - pivot_len:i])
+        window_low  = min(lows[i - pivot_len:i])
+        # Смена структуры вниз: текущий хай пробивает недавний минимум window —
+        # разворот вниз, ищем последний бычий (close > open) бар перед этим как OB
+        if lows[i] < window_low:
+            for j in range(i - 1, max(i - pivot_len - 1, -1), -1):
+                if closes[j] > opens[j]:
+                    # Bull OB зона: [low пивота, hl2 пивота] — как в оригинале Pine.
+                    # Митигирование по close < low (не по середине — так было
+                    # слишком хрупко, блоки пробивались почти сразу же).
+                    top = (highs[j] + lows[j]) / 2
+                    bottom = lows[j]
+                    candidates_bull.append((top, bottom, vols[j], j))
+                    break
+        # Смена структуры вверх: текущий лоу пробивает недавний максимум window —
+        # разворот вверх, ищем последний медвежий бар перед этим как OB
+        if highs[i] > window_high:
+            for j in range(i - 1, max(i - pivot_len - 1, -1), -1):
+                if closes[j] < opens[j]:
+                    # Bear OB зона: [hl2 пивота, high пивота]. Митигирование по
+                    # close > high.
+                    top = highs[j]
+                    bottom = (highs[j] + lows[j]) / 2
+                    candidates_bear.append((top, bottom, vols[j], j))
+                    break
+
+    def pick_best_unmitigated(candidates, is_bull):
+        best = None
+        for top, bottom, vol, j in candidates:
+            mitigated = False
+            for k in range(j + 1, n):
+                if is_bull and closes[k] < bottom:
+                    mitigated = True
+                    break
+                if not is_bull and closes[k] > top:
+                    mitigated = True
+                    break
+            if mitigated:
+                continue
+            if best is None or vol > best[2]:
+                best = (top, bottom, vol, j)
+        return best
+
+    best_bull = pick_best_unmitigated(candidates_bull, True)
+    best_bear = pick_best_unmitigated(candidates_bear, False)
+
+    bull_zone = {"top": best_bull[0], "bottom": best_bull[1]} if best_bull else None
+    bear_zone = {"top": best_bear[0], "bottom": best_bear[1]} if best_bear else None
+    return bull_zone, bear_zone
+
 def calc_volume_profile(rows, bins=40):
     """Volume Profile на Python: распределяет объём каждого бара пропорционально
     по ценовым бинам между его low и high (упрощённая версия — без раздельного
@@ -2408,10 +2481,11 @@ def calc_volume_profile(rows, bins=40):
     bin_edges = [btm + step * i for i in range(bins + 1)]
     return {"poc": poc, "vah": vah, "val": val, "bin_edges": bin_edges, "bin_volumes": bin_vols}
 
-def plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label):
-    """Рисует свечной график (mplfinance) с EMA50/200 и горизонтальными POC/VAH/VAL,
-    плюс боковую гистограмму Volume Profile справа. Сохраняет PNG во временный файл
-    и возвращает путь к нему."""
+def plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label, order_blocks=None):
+    """Рисует свечной график (mplfinance) с EMA50/200, горизонтальными POC/VAH/VAL,
+    боковой гистограммой Volume Profile справа, и (если найдены) зонами Order
+    Blocks — по одной самой значимой неотработанной зоне с каждой стороны.
+    Сохраняет PNG во временный файл и возвращает путь к нему."""
     import mplfinance as mpf
     import pandas as pd
     import matplotlib.pyplot as plt
@@ -2456,6 +2530,27 @@ def plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label):
         for lvl, color, label in [(profile["poc"], "#ffeb3b", "POC"), (profile["vah"], "#ff5252", "VAH"), (profile["val"], "#ff5252", "VAL")]:
             ax_chart.axhline(lvl, color=color, linewidth=1, linestyle="--", alpha=0.8)
 
+    if order_blocks:
+        import matplotlib.patches as patches
+        x_left = df.index[0]
+        x_right = df.index[-1]
+        bull_ob, bear_ob = order_blocks
+        if bull_ob:
+            # x в координатах осей (0..1 = вся ширина графика), y — реальные цены
+            rect = patches.Rectangle(
+                (0, bull_ob["bottom"]), 1, bull_ob["top"] - bull_ob["bottom"],
+                facecolor="#2962ff", alpha=0.18, edgecolor="#2962ff", linewidth=1, zorder=0
+            )
+            rect.set_transform(ax_chart.get_yaxis_transform())
+            ax_chart.add_patch(rect)
+        if bear_ob:
+            rect = patches.Rectangle(
+                (0, bear_ob["bottom"]), 1, bear_ob["top"] - bear_ob["bottom"],
+                facecolor="#f23645", alpha=0.18, edgecolor="#f23645", linewidth=1, zorder=0
+            )
+            rect.set_transform(ax_chart.get_yaxis_transform())
+            ax_chart.add_patch(rect)
+
     ax_chart.set_title(ticker_label + " · " + tf_label, color="white", fontsize=13, loc="left")
     fig.patch.set_facecolor("#0d1117")
 
@@ -2475,7 +2570,7 @@ def send_telegram_photo(photo_path, caption, thread_id=None):
             data["message_thread_id"] = thread_id
         requests.post(url, data=data, files=files, timeout=30)
 
-def build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile):
+def build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile, bull_ob=None, bear_ob=None):
     """Промпт для короткого текстового анализа (Sonnet 5) на основе точных цифр,
     посчитанных Python — без картинки, картинка формируется отдельно кодом."""
     system_prompt = (
@@ -2483,8 +2578,9 @@ def build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile):
         "инструменту для приватного Telegram-канала. Используй ТОЛЬКО данные, "
         "переданные ниже, не выдумывай цифры. Формат ответа: 3-5 коротких "
         "предложений простым текстом (без HTML, без markdown) — текущая структура "
-        "тренда, что говорит объём, где ключевые уровни (POC/VAH/VAL и "
-        "поддержка/сопротивление), и краткий вывод о том, на что смотреть дальше. "
+        "тренда, что говорит объём, где ключевые уровни (POC/VAH/VAL, "
+        "поддержка/сопротивление, и Order Block если есть — это зона, где стоит "
+        "ожидать реакции цены), и краткий вывод о том, на что смотреть дальше. "
         "Без гарантий и рекомендаций 'покупай/продавай' — только описание картины."
     )
     lines = []
@@ -2504,6 +2600,10 @@ def build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile):
     if profile:
         lines.append("POC: " + "{:,.4g}".format(profile["poc"]))
         lines.append("VAH: " + "{:,.4g}".format(profile["vah"]) + " / VAL: " + "{:,.4g}".format(profile["val"]))
+    if bull_ob:
+        lines.append("Order Block (бычий, зона спроса): " + "{:,.4g}".format(bull_ob["bottom"]) + "-" + "{:,.4g}".format(bull_ob["top"]))
+    if bear_ob:
+        lines.append("Order Block (медвежий, зона предложения): " + "{:,.4g}".format(bear_ob["bottom"]) + "-" + "{:,.4g}".format(bear_ob["top"]))
     user_prompt = "\n".join(lines)
     return system_prompt, user_prompt
 
@@ -2573,16 +2673,17 @@ def run_ask_analysis(raw_text):
         return False, "Не удалось посчитать метрики"
 
     profile = calc_volume_profile(rows, bins=40)
+    bull_ob, bear_ob = find_key_order_blocks(rows, pivot_len=5)
 
     tf_label = TF_CODE_LABEL.get(tf_code, tf_code)
     ticker_label = ticker_raw
 
     try:
-        chart_path = plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label)
+        chart_path = plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label, order_blocks=(bull_ob, bear_ob))
     except Exception as e:
         return False, "Ошибка отрисовки графика: " + str(e)
 
-    system_prompt, user_prompt = build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile)
+    system_prompt, user_prompt = build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile, bull_ob, bear_ob)
     text, error = call_claude_sonnet(system_prompt, user_prompt)
     if error:
         text = "(текстовый анализ недоступен: " + error + ")"
@@ -2596,6 +2697,10 @@ def run_ask_analysis(raw_text):
         caption_parts.append("POC " + "{:,.4g}".format(profile["poc"])
                               + " · область " + "{:,.4g}".format(profile["val"])
                               + "–" + "{:,.4g}".format(profile["vah"]))
+    if bull_ob:
+        caption_parts.append("&#128994; OB (спрос): " + "{:,.4g}".format(bull_ob["bottom"]) + "–" + "{:,.4g}".format(bull_ob["top"]))
+    if bear_ob:
+        caption_parts.append("&#128308; OB (предложение): " + "{:,.4g}".format(bear_ob["bottom"]) + "–" + "{:,.4g}".format(bear_ob["top"]))
     caption_parts.append(line)
     caption_parts.append(text)
     caption = "\n".join(caption_parts)
