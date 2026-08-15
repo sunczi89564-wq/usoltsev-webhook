@@ -2068,24 +2068,27 @@ def build_trade_levels(metrics, rows_4h):
     }
 
 def build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summary):
-    """Промпт для решения long/short/нет сигнала — числа даны как факт, Opus решает
-    ТОЛЬКО направление и уверенность, а не придумывает свои цифры уровней."""
+    """Промпт для решения long/short/нет сигнала. Числа даны Opus только как контекст
+    для принятия решения — сама карточка с цифрами (вход/стоп/тейк/R:R) собирается
+    кодом Python отдельно из levels, НЕ из ответа модели. Поэтому от Opus нужен
+    ТОЛЬКО чистый вердикт + короткое текстовое обоснование БЕЗ повторения цифр —
+    цифры в ответе не нужны и могут разъехаться с реальными levels."""
     system_prompt = (
         "Ты — крипто-трейдер, принимающий решение о конкретной сделке по BTC для "
         "приватного Telegram-канала. У тебя есть ДВА готовых набора уровней (long и "
-        "short), посчитанных точно по формуле — ты НЕ можешь менять эти числа, только "
-        "выбрать один из трёх вариантов ответа:\n"
+        "short, посчитаны точно по формуле) — они показаны тебе только для контекста "
+        "принятия решения, HE вставляй их числа в свой ответ, они будут добавлены "
+        "отдельно кодом. Выбери один из трёх вариантов:\n"
         "1) LONG — если контекст ясно говорит в пользу покупки у поддержки.\n"
         "2) SHORT — если контекст ясно говорит в пользу продажи у сопротивления.\n"
         "3) НЕТ СИГНАЛА — если ситуация неоднозначная, противоречивая, или ни один "
         "сценарий не выглядит явно предпочтительным. НЕ бойся выбрать этот вариант — "
         "лучше промолчать, чем дать слабый сигнал.\n\n"
-        "Формат ответа СТРОГО (HTML-теги Telegram: <b>жирный</b>, никакого markdown):\n"
-        "Если LONG или SHORT: одна строка 'РЕШЕНИЕ: LONG' или 'РЕШЕНИЕ: SHORT', затем "
-        "2-4 предложения обоснования — почему именно сейчас, что подтверждает вход "
-        "именно у этого уровня, какие риски.\n"
-        "Если сигнала нет: одна строка 'РЕШЕНИЕ: НЕТ СИГНАЛА', затем 2-3 предложения "
-        "почему — что именно делает картину неоднозначной."
+        "Формат ответа СТРОГО, ровно два элемента, без цифр уровней в тексте:\n"
+        "Строка 1: одно слово — LONG, SHORT или НЕТ_СИГНАЛА\n"
+        "Строка 2 и далее: 2-3 коротких предложения обоснования (простой текст, "
+        "без HTML-тегов, без markdown, без упоминания конкретных цифр входа/стопа/"
+        "тейка — только качественное обоснование: тренд, объём, новости, риски)."
     )
 
     lines = []
@@ -2138,9 +2141,26 @@ def build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summa
     user_prompt = "\n".join(lines)
     return system_prompt, user_prompt
 
+def parse_trade_decision(raw_text):
+    """Разбирает ответ Opus: первая непустая строка = решение (LONG/SHORT/НЕТ_СИГНАЛА
+    в любом регистре, с пробелом или подчёркиванием), остальное = обоснование."""
+    lines = [l.strip() for l in raw_text.strip().split("\n") if l.strip()]
+    if not lines:
+        return "НЕТ_СИГНАЛА", ""
+    first = lines[0].upper().replace(" ", "_").replace("-", "_")
+    if "LONG" in first:
+        decision = "LONG"
+    elif "SHORT" in first:
+        decision = "SHORT"
+    else:
+        decision = "НЕТ_СИГНАЛА"
+    reasoning = "\n".join(lines[1:]).strip()
+    return decision, reasoning
+
 def run_trade_signal(send=True):
     """Полный проход торгового модуля: метрики -> уровни по формуле -> решение Opus
-    (LONG/SHORT/нет сигнала) -> отправка. Возвращает (text, error)."""
+    (LONG/SHORT/нет сигнала) -> карточка с цифрами собирается кодом Python из levels
+    (не из текста модели) -> отправка. Возвращает (text, error)."""
     metrics = build_btc_metrics()
     if metrics is None:
         return None, "Не удалось получить достаточно свечей BTC с Bybit"
@@ -2155,16 +2175,36 @@ def run_trade_signal(send=True):
     volume_summary = get_last_volume_summary_text()
 
     system_prompt, user_prompt = build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summary)
-    text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=600)
+    raw_text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=1000)
     if error:
         return None, error
 
+    decision, reasoning = parse_trade_decision(raw_text)
+
     line = "------------------------------"
+    if decision in ("LONG", "SHORT"):
+        lv = levels["long"] if decision == "LONG" else levels["short"]
+        dir_emoji = "&#128994;" if decision == "LONG" else "&#128308;"
+        rr_text = "1:" + "{:.1f}".format(lv["rr"]) if lv["rr"] else "н/д"
+        body = (
+            dir_emoji + " <b>" + decision + "</b>\n"
+            + "Вход: $" + "{:,.0f}".format(lv["entry"]) + "\n"
+            + "Стоп: $" + "{:,.0f}".format(lv["stop"]) + "\n"
+            + "Тейк: $" + "{:,.0f}".format(lv["take"]) + "\n"
+            + "R:R: " + rr_text + "\n\n"
+            + "Обоснование: " + reasoning
+        )
+    else:
+        body = (
+            "&#9898; <b>СИГНАЛА НЕТ</b>\n\n"
+            + "Обоснование: " + (reasoning or "Ситуация неоднозначная.")
+        )
+
     full_text = (
         "&#127919; <b>ТОРГОВЫЙ СИГНАЛ BTC</b>\n"
         + datetime.now().strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
         + line + "\n"
-        + text + "\n"
+        + body + "\n"
         + line + "\n"
         + "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"
     )
