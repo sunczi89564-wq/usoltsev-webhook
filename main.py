@@ -2613,16 +2613,26 @@ def plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label, order_bl
     plt.close(fig)
     return path
 
+TELEGRAM_CAPTION_LIMIT = 1024   # жёсткий лимит Telegram на длину caption к фото
+
 def send_telegram_photo(photo_path, caption, thread_id=None):
-    """Отправка изображения в Telegram (sendPhoto) — отдельный метод от sendMessage,
-    используемого во всей остальной системе."""
+    """Отправка изображения в Telegram (sendPhoto). В отличие от прежней версии,
+    ПРОВЕРЯЕТ ответ Telegram и возвращает (ok, error) — раньше ошибка (например
+    превышение лимита в 1024 символа на caption) проглатывалась молча, и бот
+    просто ничего не отправлял без единого следа в логах."""
     url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendPhoto"
-    with open(photo_path, "rb") as f:
-        files = {"photo": f}
-        data = {"chat_id": GROUP_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-        if thread_id is not None:
-            data["message_thread_id"] = thread_id
-        requests.post(url, data=data, files=files, timeout=30)
+    try:
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": GROUP_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+            if thread_id is not None:
+                data["message_thread_id"] = thread_id
+            r = requests.post(url, data=data, files=files, timeout=30)
+        if r.status_code != 200:
+            return False, "Telegram sendPhoto HTTP " + str(r.status_code) + ": " + r.text[:300]
+        return True, None
+    except Exception as e:
+        return False, "Ошибка отправки фото: " + type(e).__name__ + ": " + str(e)
 
 def build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile, bull_ob=None, bear_ob=None):
     """Промпт для короткого текстового анализа (Sonnet 5) на основе точных цифр,
@@ -2745,29 +2755,45 @@ def run_ask_analysis(raw_text):
         text = "(текстовый анализ недоступен: " + error + ")"
 
     line = "------------------------------"
-    caption_parts = [
+    # Короткая подпись — только факты, всегда идёт вместе с фото
+    short_caption_parts = [
         "<b>" + ticker_label + " · " + tf_label + "</b>",
         "Цена: " + "{:,.4g}".format(metrics["price"]),
     ]
     if profile:
-        caption_parts.append("POC " + "{:,.4g}".format(profile["poc"])
+        short_caption_parts.append("POC " + "{:,.4g}".format(profile["poc"])
                               + " · область " + "{:,.4g}".format(profile["val"])
                               + "–" + "{:,.4g}".format(profile["vah"]))
     if bull_ob:
-        caption_parts.append("&#128994; OB (спрос): " + "{:,.4g}".format(bull_ob["bottom"]) + "–" + "{:,.4g}".format(bull_ob["top"]))
+        short_caption_parts.append("&#128994; OB (спрос): " + "{:,.4g}".format(bull_ob["bottom"]) + "–" + "{:,.4g}".format(bull_ob["top"]))
     if bear_ob:
-        caption_parts.append("&#128308; OB (предложение): " + "{:,.4g}".format(bear_ob["bottom"]) + "–" + "{:,.4g}".format(bear_ob["top"]))
-    caption_parts.append(line)
-    caption_parts.append(text)
-    caption = "\n".join(caption_parts)
+        short_caption_parts.append("&#128308; OB (предложение): " + "{:,.4g}".format(bear_ob["bottom"]) + "–" + "{:,.4g}".format(bear_ob["top"]))
+    short_caption = "\n".join(short_caption_parts)
 
+    # Полная подпись с текстом анализа — используется, только если укладывается
+    # в лимит Telegram (1024 символа на caption к фото). Если текст анализа
+    # слишком длинный (частый случай для более "многословных" ответов Sonnet,
+    # например по BTC) — фото уходит с короткой подписью, а полный текст
+    # отправляется следующим отдельным сообщением через send_telegram.
+    full_caption = short_caption + "\n" + line + "\n" + text
+    if len(full_caption) <= TELEGRAM_CAPTION_LIMIT:
+        caption_to_send = full_caption
+        send_text_separately = None
+    else:
+        caption_to_send = short_caption
+        send_text_separately = line + "\n" + text
+
+    photo_ok, photo_error = send_telegram_photo(chart_path, caption_to_send, THREAD_ASK_ANALYSIS)
     try:
-        send_telegram_photo(chart_path, caption, THREAD_ASK_ANALYSIS)
-    finally:
-        try:
-            os.remove(chart_path)
-        except:
-            pass
+        os.remove(chart_path)
+    except:
+        pass
+
+    if not photo_ok:
+        return False, photo_error
+
+    if send_text_separately:
+        send_telegram(send_text_separately, THREAD_ASK_ANALYSIS)
 
     return True, None
 
