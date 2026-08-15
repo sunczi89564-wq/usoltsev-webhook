@@ -1082,6 +1082,18 @@ def test_trade_signal():
         "preview": text[:800] if text else None
     }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
+@app.route("/test_ask_analysis")
+def test_ask_analysis():
+    """Разовый ручной тест модуля Ask Analysis через query-параметр ?q=,
+    например /test_ask_analysis?q=fartcoinusdt 4h — обходит cooldown и шлёт
+    результат прямо в тему Ask Analysis."""
+    q = request.args.get("q", "fartcoinusdt 4h")
+    global _ask_analysis_last_ts
+    with _ask_analysis_lock:
+        _ask_analysis_last_ts = 0   # обход cooldown для ручного теста
+    ok, error = run_ask_analysis(q)
+    return json.dumps({"query": q, "ok": ok, "error": error}, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
 @app.route("/test_flush_whale")
 def test_flush_whale():
     """Принудительно сбросить накопленный буфер прямо сейчас, не дожидаясь запланированного времени."""
@@ -1189,6 +1201,15 @@ def telegram_updates():
         send_telegram(format_stats("НЕДЕЛЯ", 24 * 7, tf_filter), thread_id)
     elif text.startswith("/statsmonth"):
         send_telegram(format_stats("МЕСЯЦ", 24 * 30, tf_filter), thread_id)
+    elif thread_id == THREAD_ASK_ANALYSIS and not text.startswith("/"):
+        # Любое сообщение (не команда) в теме Ask Analysis трактуется как запрос
+        # на анализ. Запускаем в отдельном потоке, чтобы не блокировать webhook
+        # Telegram (рисование графика + вызов API может занять несколько секунд).
+        def _run():
+            ok, err = run_ask_analysis(text)
+            if not ok and err:
+                send_telegram("&#9888; " + err, THREAD_ASK_ANALYSIS)
+        threading.Thread(target=_run, daemon=True).start()
 
     return "OK", 200
 
@@ -2230,6 +2251,365 @@ def trade_signal_loop():
         except:
             pass
         time.sleep(60)
+
+# ═══════════════════════════════════════════════
+# ASK ANALYSIS — анализ любого тикера по запросу (Claude Sonnet 5)
+# ═══════════════════════════════════════════════
+# Тема Telegram: THREAD_ASK_ANALYSIS. Любое сообщение в этой теме трактуется как
+# запрос "ТИКЕР ТАЙМФРЕЙМ" (гибкий парсинг). Поддерживает крипто-перпетуалы Bybit
+# (category=linear) и токенизированные акции xStocks (category=spot, суффикс x).
+# Ответ: картинка (свечи + Volume Profile сбоку с POC/VAH/VAL) через mplfinance +
+# короткий текстовый анализ от Sonnet 5 под подписью к фото.
+THREAD_ASK_ANALYSIS = 2866
+
+# Известные тикеры xStocks на Bybit (спот, суффикс x к тикеру: AAPL -> AAPLx)
+XSTOCKS_TICKERS = {"AAPL", "TSLA", "NVDA", "AMZN", "META", "GOOGL", "GOOG",
+                    "COIN", "MCD", "HOOD", "CRCL"}
+
+# Таймфреймы: пользовательский ввод -> код интервала Bybit + подпись
+TF_ALIASES = {
+    "1m": "1", "1м": "1", "1min": "1",
+    "5m": "5", "5м": "5",
+    "15m": "15", "15м": "15",
+    "30m": "30", "30м": "30",
+    "1h": "60", "1ч": "60", "60": "60", "60m": "60",
+    "2h": "120", "2ч": "120",
+    "4h": "240", "4ч": "240", "240": "240",
+    "8h": "480", "8ч": "480",
+    "12h": "720", "12ч": "720",
+    "1d": "D", "1д": "D", "d": "D", "day": "D", "дн": "D",
+    "1w": "W", "1н": "W", "w": "W", "неделя": "W",
+}
+TF_CODE_LABEL = {
+    "1": "1м", "5": "5м", "15": "15м", "30": "30м",
+    "60": "1ч", "120": "2ч", "240": "4ч", "480": "8ч", "720": "12ч",
+    "D": "1д", "W": "1нед",
+}
+
+def parse_analysis_request(text):
+    """Парсит свободный текст вида "fartcoinusdt 4h", "HYPE - 4ч", "aapl, 1d" на
+    (тикер_raw, tf_code). Разделитель — пробел/дефис/запятая, регистр не важен.
+    Возвращает None, если не удалось распознать структуру."""
+    if not text:
+        return None
+    cleaned = text.strip().lower()
+    for sep in ["-", ",", "  "]:
+        cleaned = cleaned.replace(sep, " ")
+    parts = [p for p in cleaned.split(" ") if p]
+    if len(parts) < 2:
+        return None
+    tf_raw = parts[-1]
+    ticker_raw = "".join(parts[:-1])
+    tf_code = TF_ALIASES.get(tf_raw)
+    if not tf_code:
+        return None
+    if not ticker_raw or not ticker_raw.isalnum():
+        return None
+    return ticker_raw.upper(), tf_code
+
+def resolve_symbol_and_category(ticker_raw):
+    """Определяет реальный тикер Bybit и category (linear для крипто-перпетуалов,
+    spot для токенизированных акций xStocks). Для крипто использует тот же
+    резолвер, что и остальная система (whale_symbol_cache / resolve_whale_symbol),
+    пробуя варианты с USDT."""
+    base = ticker_raw.replace("USDT", "").replace("USD", "")
+    if base in XSTOCKS_TICKERS:
+        return base + "x" + "USDT", "spot"
+    # крипто: пробуем как обычный перпетуал
+    for candidate in [ticker_raw, ticker_raw + "USDT" if not ticker_raw.endswith("USDT") else ticker_raw]:
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=" + candidate
+            r = requests.get(url, timeout=6).json()
+            if r.get("result", {}).get("list"):
+                return candidate, "linear"
+        except:
+            continue
+    return None, None
+
+def get_klines_universal(symbol, category, interval, limit=200):
+    """Свечи Bybit для произвольной категории (linear/spot). Возвращает список
+    от старых к новым, как и get_btc_klines."""
+    try:
+        url = ("https://api.bybit.com/v5/market/kline?category=" + category
+               + "&symbol=" + symbol + "&interval=" + str(interval) + "&limit=" + str(limit))
+        r = requests.get(url, timeout=15).json()
+        rows = r.get("result", {}).get("list", [])
+        return list(reversed(rows))
+    except:
+        return []
+
+def build_universal_metrics(rows):
+    """Обобщённая версия build_btc_metrics для произвольного тикера/ТФ. Считает
+    EMA50/EMA200 (если хватает баров), RSI14, объём к среднему, ближайшие уровни."""
+    if len(rows) < 30:
+        return None
+    closes = [float(r[4]) for r in rows]
+    vols   = [float(r[5]) for r in rows]
+
+    ema50  = calc_ema(closes, min(50, len(closes) - 1))
+    ema200 = calc_ema(closes, min(200, len(closes) - 1)) if len(closes) >= 60 else None
+    rsi14  = calc_rsi(closes, 14)
+
+    cur_vol = vols[-1]
+    avg_vol = sum(vols[-21:-1]) / 20 if len(vols) >= 21 else sum(vols[:-1]) / max(len(vols) - 1, 1)
+    vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 0
+
+    support, resistance, cur_price = find_support_resistance(rows, lookback=min(60, len(rows)))
+    atr = calc_atr(rows, 14)
+
+    return {
+        "price": cur_price, "ema50": ema50, "ema200": ema200, "rsi14": rsi14,
+        "vol_ratio": vol_ratio, "support": support, "resistance": resistance, "atr": atr,
+    }
+
+def calc_volume_profile(rows, bins=40):
+    """Volume Profile на Python: распределяет объём каждого бара пропорционально
+    по ценовым бинам между его low и high (упрощённая версия — без раздельного
+    веса тела/теней, аналог weightBody=False в Pine). Возвращает (poc, vah, val,
+    bin_edges, bin_volumes) для отрисовки боковой гистограммы."""
+    highs = [float(r[2]) for r in rows]
+    lows  = [float(r[3]) for r in rows]
+    vols  = [float(r[5]) for r in rows]
+
+    top = max(highs)
+    btm = min(lows)
+    if top <= btm:
+        return None
+    step = (top - btm) / bins
+    bin_vols = [0.0] * bins
+
+    for h, l, v in zip(highs, lows, vols):
+        r1 = max(0, min(bins - 1, int((l - btm) / step)))
+        r2 = max(0, min(bins - 1, int((h - btm) / step)))
+        per = v / (r2 - r1 + 1)
+        for i in range(r1, r2 + 1):
+            bin_vols[i] += per
+
+    total_v = sum(bin_vols)
+    if total_v <= 0:
+        return None
+    poc_idx = bin_vols.index(max(bin_vols))
+    poc = btm + step * (poc_idx + 0.5)
+
+    up_i, dn_i = poc_idx, poc_idx
+    va = bin_vols[poc_idx]
+    while va < total_v * 0.7 and (up_i < bins - 1 or dn_i > 0):
+        v_up = bin_vols[up_i + 1] if up_i < bins - 1 else -1
+        v_dn = bin_vols[dn_i - 1] if dn_i > 0 else -1
+        if v_up >= v_dn:
+            up_i += 1
+            va += max(v_up, 0)
+        else:
+            dn_i -= 1
+            va += max(v_dn, 0)
+    vah = btm + step * (up_i + 1)
+    val = btm + step * dn_i
+
+    bin_edges = [btm + step * i for i in range(bins + 1)]
+    return {"poc": poc, "vah": vah, "val": val, "bin_edges": bin_edges, "bin_volumes": bin_vols}
+
+def plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label):
+    """Рисует свечной график (mplfinance) с EMA50/200 и горизонтальными POC/VAH/VAL,
+    плюс боковую гистограмму Volume Profile справа. Сохраняет PNG во временный файл
+    и возвращает путь к нему."""
+    import mplfinance as mpf
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume", "turnover"])
+    df["time"] = pd.to_datetime(df["time"].astype(float), unit="ms")
+    df = df.set_index("time")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+
+    fig = plt.figure(figsize=(11, 6), facecolor="#0d1117")
+    gs = gridspec.GridSpec(1, 5, figure=fig, wspace=0.02)
+    ax_chart = fig.add_subplot(gs[0, 0:4])
+    ax_profile = fig.add_subplot(gs[0, 4], sharey=ax_chart)
+
+    # При использовании внешних осей (наш случай — свечи + отдельная боковая
+    # панель профиля) каждый addplot ОБЯЗАН явно указывать свою ось через ax=,
+    # иначе mplfinance выбрасывает ValueError при попытке смешать внешний ax
+    # у mpf.plot() с addplot без собственной оси.
+    addplots = []
+    closes = df["close"].tolist()
+    if metrics.get("ema50"):
+        ema50_series = pd.Series(pd.Series(closes).ewm(span=min(50, len(closes) - 1), adjust=False).mean().values, index=df.index)
+        addplots.append(mpf.make_addplot(ema50_series, ax=ax_chart, color="orange", width=1))
+    if metrics.get("ema200") and len(closes) >= 60:
+        ema200_series = pd.Series(pd.Series(closes).ewm(span=min(200, len(closes) - 1), adjust=False).mean().values, index=df.index)
+        addplots.append(mpf.make_addplot(ema200_series, ax=ax_chart, color="purple", width=1))
+
+    mc = mpf.make_marketcolors(up="#26a69a", down="#f23645", inherit=True)
+    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, facecolor="#0d1117", edgecolor="#0d1117", gridcolor="#222")
+
+    mpf.plot(df, type="candle", ax=ax_chart, style=style, addplot=addplots, warn_too_much_data=1000)
+
+    if profile:
+        bin_centers = [(profile["bin_edges"][i] + profile["bin_edges"][i+1]) / 2 for i in range(len(profile["bin_volumes"]))]
+        bin_height = profile["bin_edges"][1] - profile["bin_edges"][0]
+        ax_profile.barh(bin_centers, profile["bin_volumes"], height=bin_height, color="#3b5ba5", alpha=0.85)
+        ax_profile.set_facecolor("#0d1117")
+        ax_profile.axis("off")
+
+        for lvl, color, label in [(profile["poc"], "#ffeb3b", "POC"), (profile["vah"], "#ff5252", "VAH"), (profile["val"], "#ff5252", "VAL")]:
+            ax_chart.axhline(lvl, color=color, linewidth=1, linestyle="--", alpha=0.8)
+
+    ax_chart.set_title(ticker_label + " · " + tf_label, color="white", fontsize=13, loc="left")
+    fig.patch.set_facecolor("#0d1117")
+
+    path = "/tmp/ask_analysis_" + str(int(time.time())) + ".png"
+    fig.savefig(path, facecolor=fig.get_facecolor(), bbox_inches="tight", dpi=110)
+    plt.close(fig)
+    return path
+
+def send_telegram_photo(photo_path, caption, thread_id=None):
+    """Отправка изображения в Telegram (sendPhoto) — отдельный метод от sendMessage,
+    используемого во всей остальной системе."""
+    url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendPhoto"
+    with open(photo_path, "rb") as f:
+        files = {"photo": f}
+        data = {"chat_id": GROUP_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+        if thread_id is not None:
+            data["message_thread_id"] = thread_id
+        requests.post(url, data=data, files=files, timeout=30)
+
+def build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile):
+    """Промпт для короткого текстового анализа (Sonnet 5) на основе точных цифр,
+    посчитанных Python — без картинки, картинка формируется отдельно кодом."""
+    system_prompt = (
+        "Ты — крипто/фондовый аналитик, дающий краткий комментарий по запрошенному "
+        "инструменту для приватного Telegram-канала. Используй ТОЛЬКО данные, "
+        "переданные ниже, не выдумывай цифры. Формат ответа: 3-5 коротких "
+        "предложений простым текстом (без HTML, без markdown) — текущая структура "
+        "тренда, что говорит объём, где ключевые уровни (POC/VAH/VAL и "
+        "поддержка/сопротивление), и краткий вывод о том, на что смотреть дальше. "
+        "Без гарантий и рекомендаций 'покупай/продавай' — только описание картины."
+    )
+    lines = []
+    lines.append(ticker_label + " · " + tf_label)
+    lines.append("Цена: " + "{:,.4g}".format(metrics["price"]))
+    if metrics.get("ema50"):
+        lines.append("EMA50: " + "{:,.4g}".format(metrics["ema50"]))
+    if metrics.get("ema200"):
+        lines.append("EMA200: " + "{:,.4g}".format(metrics["ema200"]))
+    if metrics.get("rsi14") is not None:
+        lines.append("RSI(14): " + "{:.1f}".format(metrics["rsi14"]))
+    lines.append("Объём текущего бара к среднему: ×" + "{:.2f}".format(metrics["vol_ratio"]))
+    if metrics.get("support"):
+        lines.append("Ближайшая поддержка: " + "{:,.4g}".format(metrics["support"]))
+    if metrics.get("resistance"):
+        lines.append("Ближайшее сопротивление: " + "{:,.4g}".format(metrics["resistance"]))
+    if profile:
+        lines.append("POC: " + "{:,.4g}".format(profile["poc"]))
+        lines.append("VAH: " + "{:,.4g}".format(profile["vah"]) + " / VAL: " + "{:,.4g}".format(profile["val"]))
+    user_prompt = "\n".join(lines)
+    return system_prompt, user_prompt
+
+def call_claude_sonnet(system_prompt, user_prompt, max_tokens=500):
+    """Вызов Anthropic API с моделью Sonnet 5 (дешевле Opus, используется только
+    для интерактивного модуля Ask Analysis — расписанные модули остаются на Opus)."""
+    if not ANTHROPIC_API_KEY:
+        return None, "ANTHROPIC_API_KEY не задан"
+    try:
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": "claude-sonnet-5",
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        if r.status_code != 200:
+            return None, "HTTP " + str(r.status_code) + ": " + r.text[:500]
+        data = r.json()
+        blocks = data.get("content", [])
+        text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        if not text:
+            return None, "Пустой ответ от API"
+        return text, None
+    except requests.exceptions.Timeout:
+        return None, "TIMEOUT"
+    except Exception as e:
+        return None, "OTHER: " + type(e).__name__ + ": " + str(e)
+
+# Простая защита от спама: не чаще 1 запроса раз в 20 секунд от всей группы суммарно
+_ask_analysis_lock = threading.Lock()
+_ask_analysis_last_ts = 0
+ASK_ANALYSIS_COOLDOWN_SEC = 20
+
+def run_ask_analysis(raw_text):
+    """Полный проход: парсинг запроса -> резолв тикера -> свечи -> метрики ->
+    Volume Profile -> картинка -> текст от Sonnet -> отправка фото с подписью.
+    Возвращает (ok, error) для диагностики."""
+    global _ask_analysis_last_ts
+    with _ask_analysis_lock:
+        now_ts = time.time()
+        if now_ts - _ask_analysis_last_ts < ASK_ANALYSIS_COOLDOWN_SEC:
+            return False, "Слишком частые запросы, подождите немного"
+        _ask_analysis_last_ts = now_ts
+
+    parsed = parse_analysis_request(raw_text)
+    if not parsed:
+        return False, "Не удалось распознать запрос. Формат: ТИКЕР ТАЙМФРЕЙМ, например 'fartcoinusdt 4h' или 'aapl 1d'"
+
+    ticker_raw, tf_code = parsed
+    symbol, category = resolve_symbol_and_category(ticker_raw)
+    if not symbol:
+        return False, "Тикер '" + ticker_raw + "' не найден на Bybit"
+
+    rows = get_klines_universal(symbol, category, tf_code, limit=200)
+    if len(rows) < 30:
+        return False, "Недостаточно данных по свечам для " + symbol
+
+    metrics = build_universal_metrics(rows)
+    if metrics is None:
+        return False, "Не удалось посчитать метрики"
+
+    profile = calc_volume_profile(rows, bins=40)
+
+    tf_label = TF_CODE_LABEL.get(tf_code, tf_code)
+    ticker_label = ticker_raw
+
+    try:
+        chart_path = plot_analysis_chart(rows, metrics, profile, ticker_label, tf_label)
+    except Exception as e:
+        return False, "Ошибка отрисовки графика: " + str(e)
+
+    system_prompt, user_prompt = build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile)
+    text, error = call_claude_sonnet(system_prompt, user_prompt)
+    if error:
+        text = "(текстовый анализ недоступен: " + error + ")"
+
+    line = "------------------------------"
+    caption_parts = [
+        "<b>" + ticker_label + " · " + tf_label + "</b>",
+        "Цена: " + "{:,.4g}".format(metrics["price"]),
+    ]
+    if profile:
+        caption_parts.append("POC " + "{:,.4g}".format(profile["poc"])
+                              + " · область " + "{:,.4g}".format(profile["val"])
+                              + "–" + "{:,.4g}".format(profile["vah"]))
+    caption_parts.append(line)
+    caption_parts.append(text)
+    caption = "\n".join(caption_parts)
+
+    try:
+        send_telegram_photo(chart_path, caption, THREAD_ASK_ANALYSIS)
+    finally:
+        try:
+            os.remove(chart_path)
+        except:
+            pass
+
+    return True, None
+
 
 # Фоновый поток отслеживания цен Bybit
 price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
