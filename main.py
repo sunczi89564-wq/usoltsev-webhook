@@ -2363,12 +2363,27 @@ def debug_text_repr(text):
 
 def resolve_symbol_and_category(ticker_raw):
     """Определяет реальный тикер Bybit и category (linear для крипто-перпетуалов,
-    spot для токенизированных акций xStocks). Для крипто использует тот же
-    резолвер, что и остальная система (whale_symbol_cache / resolve_whale_symbol),
-    пробуя варианты с USDT."""
+    spot для токенизированных акций xStocks). Реальный формат xStocks на Bybit —
+    ЗАГЛАВНЫЙ суффикс X слитно с тикером, например TSLAXUSDT (не TSLAxUSDT) —
+    подтверждено официальными объявлениями Bybit и live-тикером на TradingView.
+    Как и для крипты, результат ПРОВЕРЯЕТСЯ реальным запросом к Bybit API, а не
+    просто конструируется вслепую по шаблону — чтобы не наступить на ту же
+    ошибку с регистром ещё раз, если формат для какого-то конкретного тикера
+    вдруг будет отличаться."""
     base = ticker_raw.replace("USDT", "").replace("USD", "")
+
     if base in XSTOCKS_TICKERS:
-        return base + "x" + "USDT", "spot"
+        stock_candidate = base + "X" + "USDT"
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=" + stock_candidate
+            r = requests.get(url, timeout=6).json()
+            if r.get("result", {}).get("list"):
+                return stock_candidate, "spot"
+        except:
+            pass
+        # если по каким-то причинам не нашли даже с правильным регистром —
+        # не падаем сразу, ниже всё равно попробуем как крипто-перпетуал
+
     # крипто: пробуем как обычный перпетуал
     for candidate in [ticker_raw, ticker_raw + "USDT" if not ticker_raw.endswith("USDT") else ticker_raw]:
         try:
