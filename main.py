@@ -133,7 +133,7 @@ def price_tracker_loop():
 WHALE_COINS = ["BTC", "FARTCOIN", "ETH", "LINK", "SOL", "DOGE", "PEPE", "APT",
                "SUI", "HYPE", "WIF", "AVAX", "XLM", "PUMP", "LTC", "XRP",
                "ARB", "DOT", "ATOM", "WLD", "ONDO", "C98", "TRB", "MONK"]
-WHALE_THRESHOLD_USD = 25000
+WHALE_THRESHOLD_USD = 100000
 WHALE_POLL_SECONDS  = 25
 
 whale_symbol_cache = {}   # coin -> реальный тикер на Bybit (или None если не нашли)
@@ -950,8 +950,8 @@ def test_bybit_raw():
 
 @app.route("/test_volume")
 def test_volume():
-    """Разовый принудительный проход по всем монетам без ожидания 15 минут
-    и БЕЗ учёта гистерезиса — полезно для проверки что запрос к Bybit kline работает."""
+    """Разовый принудительный проход по всем монетам без ожидания и БЕЗ учёта
+    гистерезиса — полезно для проверки что запрос к Bybit kline работает."""
     report = []
     for coin in WHALE_COINS:
         sym = whale_symbol_cache.get(coin) or resolve_whale_symbol(coin)
@@ -1042,9 +1042,38 @@ def test_volume_loop_once():
         "per_coin": debug_rows
     }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
+@app.route("/test_claude_key")
+def test_claude_key():
+    """Честная диагностика ключа Anthropic: минимальный вызов API (без свечей, без
+    промпта анализа) — только чтобы проверить, что ключ авторизуется и модель отвечает."""
+    text, error = call_claude_opus(
+        "Ты — тестовый ассистент.",
+        "Ответь одним словом: 'работает'.",
+        max_tokens=20
+    )
+    return json.dumps({
+        "key_is_set": bool(ANTHROPIC_API_KEY),
+        "model": CLAUDE_MODEL,
+        "success": error is None,
+        "response_text": text,
+        "error": error
+    }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
+@app.route("/test_btc_analysis")
+def test_btc_analysis():
+    """Разовый принудительный запуск полного BTC-анализа с реальной отправкой в
+    Telegram (тема General) — не дожидаясь 8 часов. Полезно для проверки всего
+    пайплайна целиком: свечи -> метрики -> промпт -> Opus -> отправка."""
+    text, error = run_btc_analysis(send=True)
+    return json.dumps({
+        "sent_to_telegram": error is None,
+        "error": error,
+        "preview": text[:800] if text else None
+    }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
 @app.route("/test_flush_whale")
 def test_flush_whale():
-    """Принудительно сбросить накопленный буфер прямо сейчас, не дожидаясь 30 минут."""
+    """Принудительно сбросить накопленный буфер прямо сейчас, не дожидаясь запланированного времени."""
     n = len(whale_alert_buffer)
     flush_whale_alerts()
     return "Сброшено записей: " + str(n), 200
@@ -1240,7 +1269,7 @@ def flush_whale_alerts():
         return   # все события за это окно оказались transfer — сводку не шлём вообще
     event_word = "событие" if total_events == 1 else ("событий" if total_events == 1 or total_events >= 5 or (11 <= total_events % 100 <= 14) else "события")
     text = (
-        "&#128011; <b>КИТОВАЯ СВОДКА</b> (" + str(total_events) + " " + event_word + " за 30 мин)\n"
+        "&#128011; <b>КИТОВАЯ СВОДКА</b> (" + str(total_events) + " " + event_word + ")\n"
         + line + "\n"
         + "\n".join(lines) + "\n"
         + line + "\n"
@@ -1252,7 +1281,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(daily_report, "cron", hour=4,  minute=0)
 scheduler.add_job(daily_report, "cron", hour=10, minute=0)
 scheduler.add_job(daily_report, "cron", hour=14, minute=0)
-scheduler.add_job(flush_whale_alerts, "interval", minutes=30)
+scheduler.add_job(flush_whale_alerts, "interval", hours=4)
 scheduler.start()
 
 # ═══════════════════════════════════════════════
@@ -1262,7 +1291,7 @@ ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY")
 SOLSCAN_API_KEY   = os.environ.get("SOLSCAN_API_KEY")
 # Онлайн-киты идут в ту же тему, что и биржевые киты — THREAD_WHALE (591), уже объявлена выше
 
-ONCHAIN_USD_THRESHOLD        = 50000
+ONCHAIN_USD_THRESHOLD        = 100000
 ONCHAIN_TOP_N                = 120     # сколько топ-монет по объёму брать с CoinGecko
 ONCHAIN_UNIVERSE_REFRESH_SEC = 3600    # как часто обновлять список топ-монет
 ONCHAIN_POLL_SEC             = 180     # как часто сканировать на предмет крупных переводов
@@ -1508,18 +1537,18 @@ def onchain_whale_loop():
         time.sleep(ONCHAIN_POLL_SEC)
 
 # ═══════════════════════════════════════════════
-# ВСПЛЕСКИ ОБЪЁМА (наши тикеры, 1ч, порог x1.5 с гистерезисом x1.2)
+# ВСПЛЕСКИ ОБЪЁМА (наши тикеры, проверка раз в 2 часа, порог x2.5, гистерезис x1.2)
 # ═══════════════════════════════════════════════
-# Логика: раз в 15 минут берём последние часовые свечи по каждой монете из
+# Логика: раз в VOL_POLL_SECONDS берём последние часовые свечи по каждой монете из
 # WHALE_COINS, считаем средний объём предыдущих 20 ЗАКРЫТЫХ часовых свечей и
 # сравниваем с объёмом последней закрытой свечи. Если отношение >= VOL_ALERT_RATIO —
 # кандидат на алерт. Гистерезис против дребезга: после срабатывания монета "молчит",
 # пока отношение не опустится ниже VOL_RESET_RATIO (реально успокоилось), и только
 # тогда снова может сработать. Все монеты, всплывшие за один проход, идут одной сводкой.
-VOL_ALERT_RATIO   = 1.5
+VOL_ALERT_RATIO   = 2.5      # было 1.5 — поднято по итогам ~2 недель наблюдений
 VOL_RESET_RATIO   = 1.2
 VOL_AVG_BARS      = 20     # сколько предыдущих закрытых часовых свечей берём для среднего
-VOL_POLL_SECONDS  = 900    # 15 минут
+VOL_POLL_SECONDS  = 7200   # было 900 (15 минут) — теперь раз в 2 часа, для общего обзора
 
 # coin -> "armed" (может сработать) | "cooldown" (ждём остывания ниже VOL_RESET_RATIO)
 volume_alert_state = {}
@@ -1610,6 +1639,334 @@ def volume_alert_loop():
             pass
         time.sleep(VOL_POLL_SECONDS)
 
+# ═══════════════════════════════════════════════
+# АНАЛИЗ BTC (Claude Opus 5, раз в 8 часов, тема General)
+# ═══════════════════════════════════════════════
+# Разделение труда: Python точно считает EMA50/EMA200/RSI/объём/уровни по формулам
+# на реальных свечах Bybit — эти цифры гарантированно верны, никакой арифметики
+# на откуп модели. Opus 5 получает уже готовые цифры + сырые свечи (для контекста
+# истории) + свежие новости (переиспользуем те же RSS, что и daily_report) + наши
+# собственные данные (китовая активность, объёмный сканер) и пишет ТОЛЬКО текст:
+# сценарии с вероятностями, риски, триггеры, резюме дня — по образцу, который
+# прислал пользователь (скриншот канала "Лев и Киса").
+CLAUDE_MODEL   = "claude-opus-5"
+BTC_ANALYSIS_INTERVAL_HOURS = 8
+
+def get_btc_klines(interval, limit):
+    """Свечи BTCUSDT с Bybit. interval: '240' = 4ч, 'D' = дневные.
+    Возвращает список от старых к новым (разворачиваем, Bybit отдаёт от новых к старым)."""
+    try:
+        url = ("https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT"
+               + "&interval=" + str(interval) + "&limit=" + str(limit))
+        r = requests.get(url, timeout=15).json()
+        rows = r.get("result", {}).get("list", [])
+        rows = list(reversed(rows))  # от старых к новым
+        return rows
+    except:
+        return []
+
+def calc_ema(closes, period):
+    """EMA по списку цен закрытия (от старых к новым). Возвращает значение на последнем баре."""
+    if len(closes) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = sum(closes[:period]) / period   # старт — простое среднее первых period значений
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+def calc_rsi(closes, period=14):
+    """RSI по стандартной формуле Wilder's smoothing на списке цен закрытия."""
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def find_support_resistance(rows, lookback=60):
+    """Простой поиск ближайших уровней: локальные хаи/лоу за последние lookback баров
+    (пивот = экстремум среди 2 соседей с каждой стороны), берём ближайший снизу и сверху
+    от текущей цены."""
+    if len(rows) < lookback:
+        lookback = len(rows)
+    recent = rows[-lookback:]
+    highs = [float(r[2]) for r in recent]
+    lows  = [float(r[3]) for r in recent]
+    cur_price = float(rows[-1][4])
+
+    pivot_highs = []
+    pivot_lows = []
+    for i in range(2, len(recent) - 2):
+        if highs[i] == max(highs[i-2:i+3]):
+            pivot_highs.append(highs[i])
+        if lows[i] == min(lows[i-2:i+3]):
+            pivot_lows.append(lows[i])
+
+    resistance = min([h for h in pivot_highs if h > cur_price], default=None)
+    support = max([l for l in pivot_lows if l < cur_price], default=None)
+    return support, resistance, cur_price
+
+def build_btc_metrics():
+    """Считает все числовые метрики по BTC: EMA/RSI на 4ч, объём к среднему,
+    ближайшие уровни поддержки/сопротивления. Возвращает словарь с готовыми цифрами
+    и сырыми свечами (для передачи модели как контекст истории)."""
+    rows_4h  = get_btc_klines("240", 200)   # ~33 дня по 4ч барам
+    rows_1d  = get_btc_klines("D", 90)      # 90 дней дневных
+
+    if len(rows_4h) < 60 or len(rows_1d) < 30:
+        return None
+
+    closes_4h = [float(r[4]) for r in rows_4h]
+    vols_4h   = [float(r[5]) for r in rows_4h]
+
+    ema50  = calc_ema(closes_4h, 50)
+    ema200 = calc_ema(closes_4h, 200) if len(closes_4h) >= 200 else calc_ema(closes_4h, min(200, len(closes_4h) - 1))
+    rsi14  = calc_rsi(closes_4h, 14)
+
+    cur_vol = vols_4h[-1]
+    avg_vol_4h = sum(vols_4h[-21:-1]) / 20 if len(vols_4h) >= 21 else sum(vols_4h) / len(vols_4h)
+    vol_ratio = cur_vol / avg_vol_4h if avg_vol_4h > 0 else 0
+
+    support, resistance, cur_price = find_support_resistance(rows_4h, lookback=60)
+
+    change_24h_4h_bars = 6  # 6 баров по 4ч = 24 часа
+    price_24h_ago = closes_4h[-1 - change_24h_4h_bars] if len(closes_4h) > change_24h_4h_bars else closes_4h[0]
+    change_24h_pct = (cur_price - price_24h_ago) / price_24h_ago * 100 if price_24h_ago else 0
+
+    return {
+        "price": cur_price,
+        "change_24h_pct": change_24h_pct,
+        "ema50": ema50,
+        "ema200": ema200,
+        "rsi14": rsi14,
+        "vol_ratio": vol_ratio,
+        "support": support,
+        "resistance": resistance,
+        "rows_4h_tail": rows_4h[-42:],   # последние ~7 дней 4ч баров для контекста модели
+        "rows_1d_tail": rows_1d[-30:],   # последний месяц дневных баров
+    }
+
+def get_crypto_news_headlines():
+    """Переиспользует те же RSS-источники, что и daily_report, но берёт чуть больше
+    заголовков специально для BTC-анализа (до 6 вместо 3)."""
+    sources = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+        "https://decrypt.co/feed",
+    ]
+    headlines = []
+    for url in sources:
+        if len(headlines) >= 6:
+            break
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(url, headers=headers, timeout=6)
+            root = ET.fromstring(r.content)
+            items = root.findall(".//item")
+            for item in items[:3]:
+                title = item.find("title")
+                if title is not None and title.text:
+                    text = title.text.strip()
+                    if len(text) > 120:
+                        text = text[:120] + "..."
+                    headlines.append(text)
+                    if len(headlines) >= 6:
+                        break
+        except:
+            continue
+    return headlines
+
+def call_claude_opus(system_prompt, user_prompt, max_tokens=1500):
+    """Один вызов Anthropic API. Возвращает (text, error) — error=None при успехе,
+    иначе строка с описанием проблемы (для диагностики через /test_claude_key)."""
+    if not ANTHROPIC_API_KEY:
+        return None, "ANTHROPIC_API_KEY не задан в переменных окружения"
+    try:
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": CLAUDE_MODEL,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        if r.status_code != 200:
+            return None, "HTTP " + str(r.status_code) + ": " + r.text[:500]
+        data = r.json()
+        blocks = data.get("content", [])
+        text_parts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
+        text = "\n".join(text_parts).strip()
+        if not text:
+            return None, "Пустой ответ от API: " + json.dumps(data)[:500]
+        return text, None
+    except requests.exceptions.Timeout:
+        return None, "TIMEOUT — запрос к Anthropic API не получил ответ за 60 секунд"
+    except Exception as e:
+        return None, "OTHER: " + type(e).__name__ + ": " + str(e)
+
+def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary):
+    """Собирает system + user промпт для Opus на основе готовых Python-расчётов
+    и сырого контекста (свечи/новости/наши собственные данные)."""
+    system_prompt = (
+        "Ты — опытный крипто-аналитик, пишущий короткие структурированные обзоры BTC "
+        "для приватного Telegram-канала трейдера. Стиль: по делу, без воды, конкретные "
+        "уровни и цифры. Структура ответа СТРОГО такая (используй HTML-теги Telegram: "
+        "<b>жирный</b>, обычный перенос строки — НЕ используй markdown ** или #):\n\n"
+        "1) Заголовок одной фразой, отражающий суть текущей картины.\n"
+        "2) Блок 'Где мы:' — 2-4 предложения: текущая цена, тренд по EMA, RSI, объём, "
+        "куда давит рынок.\n"
+        "3) 2-3 сценария (например 'Пробой вниз', 'Боковик', 'Отскок вверх'), каждый с "
+        "оценкой вероятности в % (сумма всех сценариев = 100%), кратким описанием, "
+        "конкретным триггером (что должно произойти технически) и целевым уровнем.\n"
+        "4) Блок 'Суть дня:' — 2-3 предложения итогового вывода и на что смотреть.\n\n"
+        "Проценты вероятности — твоя экспертная оценка на основе предоставленных цифр, "
+        "истории свечей и новостного фона. Не выдумывай технические цифры (EMA, RSI, "
+        "уровни) — используй ТОЛЬКО те, что даны тебе явно ниже, они посчитаны точно "
+        "по формулам. Свечи и новости — это твой контекст для оценки вероятностей и "
+        "рассуждения, не источник для новых числовых расчётов."
+    )
+
+    lines = []
+    lines.append("ТЕКУЩИЕ ДАННЫЕ ПО BTC (посчитаны точно, используй как есть):")
+    lines.append("Цена: $" + "{:,.0f}".format(metrics["price"]))
+    lines.append("Изменение за 24ч: " + "{:+.2f}".format(metrics["change_24h_pct"]) + "%")
+    if metrics["ema50"]:
+        lines.append("EMA50 (4ч): $" + "{:,.0f}".format(metrics["ema50"]))
+    if metrics["ema200"]:
+        lines.append("EMA200 (4ч): $" + "{:,.0f}".format(metrics["ema200"]))
+    if metrics["rsi14"] is not None:
+        lines.append("RSI(14) на 4ч: " + "{:.1f}".format(metrics["rsi14"]))
+    lines.append("Текущий объём (4ч бар) к среднему за 20 баров: ×" + "{:.2f}".format(metrics["vol_ratio"]))
+    if metrics["support"]:
+        lines.append("Ближайшая поддержка: $" + "{:,.0f}".format(metrics["support"]))
+    if metrics["resistance"]:
+        lines.append("Ближайшее сопротивление: $" + "{:,.0f}".format(metrics["resistance"]))
+
+    lines.append("")
+    lines.append("СВЕЖИЕ НОВОСТИ (для оценки фона, не для технических расчётов):")
+    if news:
+        for h in news:
+            lines.append("- " + h)
+    else:
+        lines.append("(новости недоступны в этот раз)")
+
+    if whale_summary:
+        lines.append("")
+        lines.append("НАША КИТОВАЯ АКТИВНОСТЬ (последние данные из системы):")
+        lines.append(whale_summary)
+
+    if volume_summary:
+        lines.append("")
+        lines.append("НАШИ ДАННЫЕ ПО ВСПЛЕСКАМ ОБЪЁМА (последние данные из системы):")
+        lines.append(volume_summary)
+
+    lines.append("")
+    lines.append("ИСТОРИЯ СВЕЧЕЙ ДЛЯ КОНТЕКСТА (4ч, последние ~7 дней, "
+                  "формат [время, open, high, low, close, volume]):")
+    for row in metrics["rows_4h_tail"]:
+        lines.append(str(row[:6]))
+
+    lines.append("")
+    lines.append("ИСТОРИЯ СВЕЧЕЙ ДЛЯ КОНТЕКСТА (дневные, последний месяц, "
+                  "формат [время, open, high, low, close, volume]):")
+    for row in metrics["rows_1d_tail"]:
+        lines.append(str(row[:6]))
+
+    user_prompt = "\n".join(lines)
+    return system_prompt, user_prompt
+
+def get_last_whale_summary_text():
+    """Короткая сводка последних китовых данных из буфера — не отправка, просто
+    текстовый снимок для контекста промпта BTC-анализа."""
+    with whale_alert_lock:
+        entries = list(whale_alert_buffer)
+    if not entries:
+        return None
+    btc_entries = [e for e in entries if e.get("coin") == "BTC" and e.get("category") in ("buy", "sell")]
+    if not btc_entries:
+        return None
+    buy_sum = sum(e["value"] for e in btc_entries if e["category"] == "buy")
+    sell_sum = sum(e["value"] for e in btc_entries if e["category"] == "sell")
+    return "BTC накопление: $" + "{:,.0f}".format(buy_sum) + " | BTC продажа: $" + "{:,.0f}".format(sell_sum)
+
+def get_last_volume_summary_text():
+    """Текущий коэффициент объёма BTC (из того же расчёта, что и volume_alert_loop) —
+    короткий снимок для контекста промпта."""
+    sym = whale_symbol_cache.get("BTC")
+    if not sym:
+        return None
+    rows = get_hourly_klines(sym, VOL_AVG_BARS + 2)
+    if len(rows) < VOL_AVG_BARS + 2:
+        return None
+    last_closed = rows[1]
+    avg_rows = rows[2:2 + VOL_AVG_BARS]
+    try:
+        cur_vol = float(last_closed[5])
+        avg_vol = sum(float(r[5]) for r in avg_rows) / len(avg_rows)
+        ratio = cur_vol / avg_vol if avg_vol > 0 else 0
+        return "Часовой объём BTC сейчас: ×" + "{:.2f}".format(ratio) + " к среднему"
+    except:
+        return None
+
+def run_btc_analysis(send=True):
+    """Полный проход: считает метрики, собирает промпт, вызывает Opus, при send=True
+    отправляет в THREAD_GENERAL. Возвращает (text, error) для диагностики."""
+    metrics = build_btc_metrics()
+    if metrics is None:
+        return None, "Не удалось получить достаточно свечей BTC с Bybit"
+
+    news = get_crypto_news_headlines()
+    whale_summary = get_last_whale_summary_text()
+    volume_summary = get_last_volume_summary_text()
+
+    system_prompt, user_prompt = build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary)
+    text, error = call_claude_opus(system_prompt, user_prompt)
+    if error:
+        return None, error
+
+    line = "------------------------------"
+    full_text = (
+        "&#8383; <b>АНАЛИЗ BTC</b>\n"
+        + datetime.now().strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
+        + line + "\n"
+        + text + "\n"
+        + line + "\n"
+        + "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"
+    )
+
+    if send:
+        send_telegram(full_text, THREAD_GENERAL)
+
+    return full_text, None
+
+def btc_analysis_loop():
+    """Фоновый поток: раз в BTC_ANALYSIS_INTERVAL_HOURS часов запускает полный анализ
+    и шлёт в тему General. Ошибки логируются в per-iteration try/except, чтобы одна
+    неудачная попытка не убила поток навсегда."""
+    while True:
+        try:
+            run_btc_analysis(send=True)
+        except:
+            pass
+        time.sleep(BTC_ANALYSIS_INTERVAL_HOURS * 3600)
+
 # Фоновый поток отслеживания цен Bybit
 price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
 price_thread.start()
@@ -1622,9 +1979,13 @@ whale_thread.start()
 onchain_thread = threading.Thread(target=onchain_whale_loop, daemon=True)
 onchain_thread.start()
 
-# Фоновый поток алертов по всплескам объёма (наши тикеры, 1ч)
+# Фоновый поток алертов по всплескам объёма (наши тикеры)
 volume_thread = threading.Thread(target=volume_alert_loop, daemon=True)
 volume_thread.start()
+
+# Фоновый поток анализа BTC (Claude Opus 5, раз в 8 часов)
+btc_analysis_thread = threading.Thread(target=btc_analysis_loop, daemon=True)
+btc_analysis_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
