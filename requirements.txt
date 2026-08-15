@@ -2,3 +2,6 @@ flask
 requests
 anthropic
 apscheduler
+mplfinance
+pandas
+matplotlib
