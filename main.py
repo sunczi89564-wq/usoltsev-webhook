@@ -1071,6 +1071,17 @@ def test_btc_analysis():
         "preview": text[:800] if text else None
     }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
+@app.route("/test_trade_signal")
+def test_trade_signal():
+    """Разовый принудительный запуск торгового модуля (LONG/SHORT/нет сигнала)
+    с реальной отправкой в Telegram — не дожидаясь 6:00 или 18:00."""
+    text, error = run_trade_signal(send=True)
+    return json.dumps({
+        "sent_to_telegram": error is None,
+        "error": error,
+        "preview": text[:800] if text else None
+    }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
 @app.route("/test_flush_whale")
 def test_flush_whale():
     """Принудительно сбросить накопленный буфер прямо сейчас, не дожидаясь запланированного времени."""
@@ -1967,6 +1978,219 @@ def btc_analysis_loop():
             pass
         time.sleep(BTC_ANALYSIS_INTERVAL_HOURS * 3600)
 
+# ═══════════════════════════════════════════════
+# ТОРГОВЫЙ СИГНАЛ BTC (Claude Opus 5, дважды в день, тема General)
+# ═══════════════════════════════════════════════
+# Отдельный самостоятельный модуль от текстового анализа выше. Логика та же:
+# Python считает уровни ТОЧНО по формуле (вход у ближайшего значимого уровня,
+# стоп за уровнем с запасом в ATR, тейк — следующий уровень или R:R 1:2 как
+# запасной вариант), Opus получает готовые цифры + весь контекст (свечи, новости,
+# наши китовые/объёмные данные) и либо даёт сигнал с обоснованием, либо явно
+# пишет "чёткого сигнала нет" — если её собственная уверенность не высокая
+# или контекст противоречивый. Модель НЕ придумывает цифры уровней сама.
+TRADE_SIGNAL_HOURS_UTC5 = [6, 18]   # время отправки, UTC+5, по 24ч формату
+
+def calc_atr(rows, period=14):
+    """ATR по списку свечей [start, open, high, low, close, volume, turnover] —
+    True Range усредняется простым SMA за period баров (последнее значение)."""
+    if len(rows) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(rows)):
+        high = float(rows[i][2])
+        low  = float(rows[i][3])
+        prev_close = float(rows[i - 1][4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
+def find_next_level(rows, ref_price, direction, lookback=120):
+    """Ищет следующий пивотный уровень дальше по цепочке от ref_price в направлении
+    сделки (для тейка). direction: 'up' — следующее сопротивление выше ref_price,
+    'down' — следующая поддержка ниже ref_price."""
+    if len(rows) < lookback:
+        lookback = len(rows)
+    recent = rows[-lookback:]
+    highs = [float(r[2]) for r in recent]
+    lows  = [float(r[3]) for r in recent]
+
+    pivot_highs = []
+    pivot_lows = []
+    for i in range(2, len(recent) - 2):
+        if highs[i] == max(highs[i-2:i+3]):
+            pivot_highs.append(highs[i])
+        if lows[i] == min(lows[i-2:i+3]):
+            pivot_lows.append(lows[i])
+
+    if direction == "up":
+        candidates = sorted([h for h in pivot_highs if h > ref_price])
+    else:
+        candidates = sorted([l for l in pivot_lows if l < ref_price], reverse=True)
+    return candidates[0] if candidates else None
+
+def build_trade_levels(metrics, rows_4h):
+    """Считает конкретные торговые уровни ТОЧНО по формуле для обоих направлений
+    (long и short) — Opus далее выберет, какое (если любое) обосновано, но сами
+    числа фиксированы кодом, не моделью."""
+    atr = calc_atr(rows_4h, 14)
+    if atr is None or not metrics.get("support") or not metrics.get("resistance"):
+        return None
+
+    support = metrics["support"]
+    resistance = metrics["resistance"]
+    cur_price = metrics["price"]
+
+    # LONG: вход в зоне поддержки (небольшой буфер внутрь диапазона), стоп ниже
+    # поддержки на 0.5 ATR, тейк — следующий уровень сопротивления дальше по цепочке,
+    # либо R:R 1:2 как запасной вариант, если следующего уровня не нашлось.
+    long_entry = support + atr * 0.1
+    long_stop  = support - atr * 0.5
+    long_risk  = long_entry - long_stop
+    long_next_level = find_next_level(rows_4h, resistance, "up")
+    long_take = long_next_level if long_next_level else long_entry + long_risk * 2
+    long_rr = (long_take - long_entry) / long_risk if long_risk > 0 else None
+
+    # SHORT: зеркально у сопротивления
+    short_entry = resistance - atr * 0.1
+    short_stop  = resistance + atr * 0.5
+    short_risk  = short_stop - short_entry
+    short_next_level = find_next_level(rows_4h, support, "down")
+    short_take = short_next_level if short_next_level else short_entry - short_risk * 2
+    short_rr = (short_entry - short_take) / short_risk if short_risk > 0 else None
+
+    return {
+        "atr": atr,
+        "long":  {"entry": long_entry,  "stop": long_stop,  "take": long_take,  "rr": long_rr},
+        "short": {"entry": short_entry, "stop": short_stop, "take": short_take, "rr": short_rr},
+        "cur_price": cur_price,
+    }
+
+def build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summary):
+    """Промпт для решения long/short/нет сигнала — числа даны как факт, Opus решает
+    ТОЛЬКО направление и уверенность, а не придумывает свои цифры уровней."""
+    system_prompt = (
+        "Ты — крипто-трейдер, принимающий решение о конкретной сделке по BTC для "
+        "приватного Telegram-канала. У тебя есть ДВА готовых набора уровней (long и "
+        "short), посчитанных точно по формуле — ты НЕ можешь менять эти числа, только "
+        "выбрать один из трёх вариантов ответа:\n"
+        "1) LONG — если контекст ясно говорит в пользу покупки у поддержки.\n"
+        "2) SHORT — если контекст ясно говорит в пользу продажи у сопротивления.\n"
+        "3) НЕТ СИГНАЛА — если ситуация неоднозначная, противоречивая, или ни один "
+        "сценарий не выглядит явно предпочтительным. НЕ бойся выбрать этот вариант — "
+        "лучше промолчать, чем дать слабый сигнал.\n\n"
+        "Формат ответа СТРОГО (HTML-теги Telegram: <b>жирный</b>, никакого markdown):\n"
+        "Если LONG или SHORT: одна строка 'РЕШЕНИЕ: LONG' или 'РЕШЕНИЕ: SHORT', затем "
+        "2-4 предложения обоснования — почему именно сейчас, что подтверждает вход "
+        "именно у этого уровня, какие риски.\n"
+        "Если сигнала нет: одна строка 'РЕШЕНИЕ: НЕТ СИГНАЛА', затем 2-3 предложения "
+        "почему — что именно делает картину неоднозначной."
+    )
+
+    lines = []
+    lines.append("ТЕКУЩАЯ ЦЕНА: $" + "{:,.0f}".format(metrics["price"]))
+    if metrics["ema50"]:
+        lines.append("EMA50 (4ч): $" + "{:,.0f}".format(metrics["ema50"]))
+    if metrics["ema200"]:
+        lines.append("EMA200 (4ч): $" + "{:,.0f}".format(metrics["ema200"]))
+    if metrics["rsi14"] is not None:
+        lines.append("RSI(14) на 4ч: " + "{:.1f}".format(metrics["rsi14"]))
+    lines.append("Объём текущего 4ч бара к среднему: ×" + "{:.2f}".format(metrics["vol_ratio"]))
+    lines.append("ATR(14, 4ч): $" + "{:,.0f}".format(levels["atr"]))
+
+    lines.append("")
+    lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ LONG (посчитан точно, не меняй числа):")
+    lines.append("Вход: $" + "{:,.0f}".format(levels["long"]["entry"]))
+    lines.append("Стоп: $" + "{:,.0f}".format(levels["long"]["stop"]))
+    lines.append("Тейк: $" + "{:,.0f}".format(levels["long"]["take"]))
+    if levels["long"]["rr"]:
+        lines.append("R:R: 1:" + "{:.1f}".format(levels["long"]["rr"]))
+
+    lines.append("")
+    lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ SHORT (посчитан точно, не меняй числа):")
+    lines.append("Вход: $" + "{:,.0f}".format(levels["short"]["entry"]))
+    lines.append("Стоп: $" + "{:,.0f}".format(levels["short"]["stop"]))
+    lines.append("Тейк: $" + "{:,.0f}".format(levels["short"]["take"]))
+    if levels["short"]["rr"]:
+        lines.append("R:R: 1:" + "{:.1f}".format(levels["short"]["rr"]))
+
+    lines.append("")
+    lines.append("СВЕЖИЕ НОВОСТИ:")
+    if news:
+        for h in news:
+            lines.append("- " + h)
+    else:
+        lines.append("(недоступны)")
+
+    if whale_summary:
+        lines.append("")
+        lines.append("КИТОВАЯ АКТИВНОСТЬ: " + whale_summary)
+    if volume_summary:
+        lines.append("")
+        lines.append("ОБЪЁМ: " + volume_summary)
+
+    lines.append("")
+    lines.append("ИСТОРИЯ СВЕЧЕЙ 4ч (последние ~7 дней, [время,open,high,low,close,volume]):")
+    for row in metrics["rows_4h_tail"]:
+        lines.append(str(row[:6]))
+
+    user_prompt = "\n".join(lines)
+    return system_prompt, user_prompt
+
+def run_trade_signal(send=True):
+    """Полный проход торгового модуля: метрики -> уровни по формуле -> решение Opus
+    (LONG/SHORT/нет сигнала) -> отправка. Возвращает (text, error)."""
+    metrics = build_btc_metrics()
+    if metrics is None:
+        return None, "Не удалось получить достаточно свечей BTC с Bybit"
+
+    rows_4h = get_btc_klines("240", 200)
+    levels = build_trade_levels(metrics, rows_4h)
+    if levels is None:
+        return None, "Не удалось посчитать уровни (нет ATR или уровней поддержки/сопротивления)"
+
+    news = get_crypto_news_headlines()
+    whale_summary = get_last_whale_summary_text()
+    volume_summary = get_last_volume_summary_text()
+
+    system_prompt, user_prompt = build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summary)
+    text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=600)
+    if error:
+        return None, error
+
+    line = "------------------------------"
+    full_text = (
+        "&#127919; <b>ТОРГОВЫЙ СИГНАЛ BTC</b>\n"
+        + datetime.now().strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
+        + line + "\n"
+        + text + "\n"
+        + line + "\n"
+        + "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"
+    )
+
+    if send:
+        send_telegram(full_text, THREAD_GENERAL)
+
+    return full_text, None
+
+def trade_signal_loop():
+    """Фоновый поток: проверяет каждую минуту, не наступил ли один из часов
+    TRADE_SIGNAL_HOURS_UTC5 (6:00 или 18:00) — и если да, запускает сигнал один раз
+    за эту минуту (защита от повторной отправки внутри той же минуты через флаг)."""
+    last_sent_key = None
+    while True:
+        try:
+            now = datetime.now()
+            if now.hour in TRADE_SIGNAL_HOURS_UTC5 and now.minute == 0:
+                key = now.strftime("%Y-%m-%d-%H")
+                if key != last_sent_key:
+                    run_trade_signal(send=True)
+                    last_sent_key = key
+        except:
+            pass
+        time.sleep(60)
+
 # Фоновый поток отслеживания цен Bybit
 price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
 price_thread.start()
@@ -1986,6 +2210,10 @@ volume_thread.start()
 # Фоновый поток анализа BTC (Claude Opus 5, раз в 8 часов)
 btc_analysis_thread = threading.Thread(target=btc_analysis_loop, daemon=True)
 btc_analysis_thread.start()
+
+# Фоновый поток торговых сигналов BTC (Claude Opus 5, дважды в день: 6:00 и 18:00 UTC+5)
+trade_signal_thread = threading.Thread(target=trade_signal_loop, daemon=True)
+trade_signal_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
