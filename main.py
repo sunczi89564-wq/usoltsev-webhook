@@ -1769,6 +1769,24 @@ def calc_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+def fmt_price(value):
+    """Форматирует цену в ОБЫЧНОЙ десятичной записи (никогда не в экспоненциальной,
+    как это делал прежний "{:,.4g}" на больших числах вроде цены BTC — там 4
+    значащие цифры на 5-значном числе переключали Python на запись вида
+    "6.313e+04"). Число знаков после запятой подбирается под порядок величины,
+    чтобы одинаково хорошо выглядели и BTC (~$63,000), и LINK (~$8.7), и мелкие
+    дробные тикеры вроде мемкоинов (~$0.0001423)."""
+    v = abs(value)
+    if v >= 1000:
+        return "{:,.0f}".format(value)
+    elif v >= 1:
+        return "{:,.2f}".format(value)
+    elif v >= 0.01:
+        return "{:,.4f}".format(value)
+    else:
+        s = "{:,.8f}".format(value).rstrip("0").rstrip(".")
+        return s
+
 def find_support_resistance(rows, lookback=60):
     """Простой поиск ближайших уровней: локальные хаи/лоу за последние lookback баров
     (пивот = экстремум среди 2 соседей с каждой стороны), берём ближайший снизу и сверху
@@ -2162,29 +2180,29 @@ def build_trade_signal_prompt(ticker_label, metrics, levels, rows_4h_tail, news,
     )
 
     lines = []
-    lines.append("ТЕКУЩАЯ ЦЕНА " + ticker_label + ": $" + "{:,.4g}".format(metrics["price"]))
+    lines.append("ТЕКУЩАЯ ЦЕНА " + ticker_label + ": $" + fmt_price(metrics["price"]))
     if metrics.get("ema50"):
-        lines.append("EMA50 (4ч): $" + "{:,.4g}".format(metrics["ema50"]))
+        lines.append("EMA50 (4ч): $" + fmt_price(metrics["ema50"]))
     if metrics.get("ema200"):
-        lines.append("EMA200 (4ч): $" + "{:,.4g}".format(metrics["ema200"]))
+        lines.append("EMA200 (4ч): $" + fmt_price(metrics["ema200"]))
     if metrics.get("rsi14") is not None:
         lines.append("RSI(14) на 4ч: " + "{:.1f}".format(metrics["rsi14"]))
     lines.append("Объём текущего 4ч бара к среднему: ×" + "{:.2f}".format(metrics["vol_ratio"]))
-    lines.append("ATR(14, 4ч): $" + "{:,.4g}".format(levels["atr"]))
+    lines.append("ATR(14, 4ч): $" + fmt_price(levels["atr"]))
 
     lines.append("")
     lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ LONG (посчитан точно, не меняй числа):")
-    lines.append("Вход: $" + "{:,.4g}".format(levels["long"]["entry"]))
-    lines.append("Стоп: $" + "{:,.4g}".format(levels["long"]["stop"]))
-    lines.append("Тейк: $" + "{:,.4g}".format(levels["long"]["take"]))
+    lines.append("Вход: $" + fmt_price(levels["long"]["entry"]))
+    lines.append("Стоп: $" + fmt_price(levels["long"]["stop"]))
+    lines.append("Тейк: $" + fmt_price(levels["long"]["take"]))
     if levels["long"]["rr"]:
         lines.append("R:R: 1:" + "{:.1f}".format(levels["long"]["rr"]))
 
     lines.append("")
     lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ SHORT (посчитан точно, не меняй числа):")
-    lines.append("Вход: $" + "{:,.4g}".format(levels["short"]["entry"]))
-    lines.append("Стоп: $" + "{:,.4g}".format(levels["short"]["stop"]))
-    lines.append("Тейк: $" + "{:,.4g}".format(levels["short"]["take"]))
+    lines.append("Вход: $" + fmt_price(levels["short"]["entry"]))
+    lines.append("Стоп: $" + fmt_price(levels["short"]["stop"]))
+    lines.append("Тейк: $" + fmt_price(levels["short"]["take"]))
     if levels["short"]["rr"]:
         lines.append("R:R: 1:" + "{:.1f}".format(levels["short"]["rr"]))
 
@@ -2268,9 +2286,9 @@ def run_single_ticker_signal(coin):
         block = (
             "<b>" + coin + "</b>\n"
             + dir_emoji + " <b>" + decision + "</b>\n"
-            + "Вход: $" + "{:,.4g}".format(lv["entry"]) + "\n"
-            + "Стоп: $" + "{:,.4g}".format(lv["stop"]) + "\n"
-            + "Тейк: $" + "{:,.4g}".format(lv["take"]) + "\n"
+            + "Вход: $" + fmt_price(lv["entry"]) + "\n"
+            + "Стоп: $" + fmt_price(lv["stop"]) + "\n"
+            + "Тейк: $" + fmt_price(lv["take"]) + "\n"
             + "R:R: " + rr_text + "\n"
             + "Обоснование: " + reasoning
         )
@@ -2712,25 +2730,25 @@ def build_ask_analysis_prompt(ticker_label, tf_label, metrics, profile, bull_ob=
     )
     lines = []
     lines.append(ticker_label + " · " + tf_label)
-    lines.append("Цена: " + "{:,.4g}".format(metrics["price"]))
+    lines.append("Цена: " + fmt_price(metrics["price"]))
     if metrics.get("ema50"):
-        lines.append("EMA50: " + "{:,.4g}".format(metrics["ema50"]))
+        lines.append("EMA50: " + fmt_price(metrics["ema50"]))
     if metrics.get("ema200"):
-        lines.append("EMA200: " + "{:,.4g}".format(metrics["ema200"]))
+        lines.append("EMA200: " + fmt_price(metrics["ema200"]))
     if metrics.get("rsi14") is not None:
         lines.append("RSI(14): " + "{:.1f}".format(metrics["rsi14"]))
     lines.append("Объём текущего бара к среднему: ×" + "{:.2f}".format(metrics["vol_ratio"]))
     if metrics.get("support"):
-        lines.append("Ближайшая поддержка: " + "{:,.4g}".format(metrics["support"]))
+        lines.append("Ближайшая поддержка: " + fmt_price(metrics["support"]))
     if metrics.get("resistance"):
-        lines.append("Ближайшее сопротивление: " + "{:,.4g}".format(metrics["resistance"]))
+        lines.append("Ближайшее сопротивление: " + fmt_price(metrics["resistance"]))
     if profile:
-        lines.append("POC: " + "{:,.4g}".format(profile["poc"]))
-        lines.append("VAH: " + "{:,.4g}".format(profile["vah"]) + " / VAL: " + "{:,.4g}".format(profile["val"]))
+        lines.append("POC: " + fmt_price(profile["poc"]))
+        lines.append("VAH: " + fmt_price(profile["vah"]) + " / VAL: " + fmt_price(profile["val"]))
     if bull_ob:
-        lines.append("Order Block (бычий, зона спроса): " + "{:,.4g}".format(bull_ob["bottom"]) + "-" + "{:,.4g}".format(bull_ob["top"]))
+        lines.append("Order Block (бычий, зона спроса): " + fmt_price(bull_ob["bottom"]) + "-" + fmt_price(bull_ob["top"]))
     if bear_ob:
-        lines.append("Order Block (медвежий, зона предложения): " + "{:,.4g}".format(bear_ob["bottom"]) + "-" + "{:,.4g}".format(bear_ob["top"]))
+        lines.append("Order Block (медвежий, зона предложения): " + fmt_price(bear_ob["bottom"]) + "-" + fmt_price(bear_ob["top"]))
     user_prompt = "\n".join(lines)
     return system_prompt, user_prompt
 
@@ -2821,16 +2839,16 @@ def run_ask_analysis(raw_text):
     # Короткая подпись — только факты, всегда идёт вместе с фото
     short_caption_parts = [
         "<b>" + ticker_label + " · " + tf_label + "</b>",
-        "Цена: " + "{:,.4g}".format(metrics["price"]),
+        "Цена: " + fmt_price(metrics["price"]),
     ]
     if profile:
-        short_caption_parts.append("POC " + "{:,.4g}".format(profile["poc"])
-                              + " · область " + "{:,.4g}".format(profile["val"])
-                              + "–" + "{:,.4g}".format(profile["vah"]))
+        short_caption_parts.append("POC " + fmt_price(profile["poc"])
+                              + " · область " + fmt_price(profile["val"])
+                              + "–" + fmt_price(profile["vah"]))
     if bull_ob:
-        short_caption_parts.append("&#128994; OB (спрос): " + "{:,.4g}".format(bull_ob["bottom"]) + "–" + "{:,.4g}".format(bull_ob["top"]))
+        short_caption_parts.append("&#128994; OB (спрос): " + fmt_price(bull_ob["bottom"]) + "–" + fmt_price(bull_ob["top"]))
     if bear_ob:
-        short_caption_parts.append("&#128308; OB (предложение): " + "{:,.4g}".format(bear_ob["bottom"]) + "–" + "{:,.4g}".format(bear_ob["top"]))
+        short_caption_parts.append("&#128308; OB (предложение): " + fmt_price(bear_ob["bottom"]) + "–" + fmt_price(bear_ob["top"]))
     short_caption = "\n".join(short_caption_parts)
 
     # Полная подпись с текстом анализа — используется, только если укладывается
