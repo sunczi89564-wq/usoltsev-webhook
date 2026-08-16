@@ -1966,24 +1966,24 @@ def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary):
     user_prompt = "\n".join(lines)
     return system_prompt, user_prompt
 
-def get_last_whale_summary_text():
-    """Короткая сводка последних китовых данных из буфера — не отправка, просто
-    текстовый снимок для контекста промпта BTC-анализа."""
+def get_last_whale_summary_text(coin="BTC"):
+    """Короткая сводка последних китовых данных из буфера для указанной монеты —
+    не отправка, просто текстовый снимок для контекста промпта анализа."""
     with whale_alert_lock:
         entries = list(whale_alert_buffer)
     if not entries:
         return None
-    btc_entries = [e for e in entries if e.get("coin") == "BTC" and e.get("category") in ("buy", "sell")]
-    if not btc_entries:
+    coin_entries = [e for e in entries if e.get("coin") == coin and e.get("category") in ("buy", "sell")]
+    if not coin_entries:
         return None
-    buy_sum = sum(e["value"] for e in btc_entries if e["category"] == "buy")
-    sell_sum = sum(e["value"] for e in btc_entries if e["category"] == "sell")
-    return "BTC накопление: $" + "{:,.0f}".format(buy_sum) + " | BTC продажа: $" + "{:,.0f}".format(sell_sum)
+    buy_sum = sum(e["value"] for e in coin_entries if e["category"] == "buy")
+    sell_sum = sum(e["value"] for e in coin_entries if e["category"] == "sell")
+    return coin + " накопление: $" + "{:,.0f}".format(buy_sum) + " | " + coin + " продажа: $" + "{:,.0f}".format(sell_sum)
 
-def get_last_volume_summary_text():
-    """Текущий коэффициент объёма BTC (из того же расчёта, что и volume_alert_loop) —
-    короткий снимок для контекста промпта."""
-    sym = whale_symbol_cache.get("BTC")
+def get_last_volume_summary_text(coin="BTC"):
+    """Текущий коэффициент объёма указанной монеты (из того же расчёта, что и
+    volume_alert_loop) — короткий снимок для контекста промпта."""
+    sym = whale_symbol_cache.get(coin)
     if not sym:
         return None
     rows = get_hourly_klines(sym, VOL_AVG_BARS + 2)
@@ -1995,7 +1995,7 @@ def get_last_volume_summary_text():
         cur_vol = float(last_closed[5])
         avg_vol = sum(float(r[5]) for r in avg_rows) / len(avg_rows)
         ratio = cur_vol / avg_vol if avg_vol > 0 else 0
-        return "Часовой объём BTC сейчас: ×" + "{:.2f}".format(ratio) + " к среднему"
+        return "Часовой объём " + coin + " сейчас: ×" + "{:.2f}".format(ratio) + " к среднему"
     except:
         return None
 
@@ -2042,16 +2042,21 @@ def btc_analysis_loop():
         time.sleep(BTC_ANALYSIS_INTERVAL_HOURS * 3600)
 
 # ═══════════════════════════════════════════════
-# ТОРГОВЫЙ СИГНАЛ BTC (Claude Opus 5, дважды в день, тема General)
+# ТОРГОВЫЙ СИГНАЛ (Claude Opus 5, 4 раза в день, тема General)
 # ═══════════════════════════════════════════════
-# Отдельный самостоятельный модуль от текстового анализа выше. Логика та же:
+# Мультитикерный модуль — BTC, ETH, LINK в одном сообщении. Логика та же:
 # Python считает уровни ТОЧНО по формуле (вход у ближайшего значимого уровня,
 # стоп за уровнем с запасом в ATR, тейк — следующий уровень или R:R 1:2 как
 # запасной вариант), Opus получает готовые цифры + весь контекст (свечи, новости,
 # наши китовые/объёмные данные) и либо даёт сигнал с обоснованием, либо явно
 # пишет "чёткого сигнала нет" — если её собственная уверенность не высокая
 # или контекст противоречивый. Модель НЕ придумывает цифры уровней сама.
-TRADE_SIGNAL_HOURS_UTC5 = [6, 18]   # время отправки, UTC+5, по 24ч формату
+# Использует те же универсальные функции метрик/свечей, что и Ask Analysis
+# (build_universal_metrics, get_klines_universal, resolve_symbol_and_category),
+# чтобы не дублировать BTC-специфичную логику под каждый новый тикер.
+TRADE_SIGNAL_HOURS_UTC5 = [7, 14, 18, 22]   # время отправки, UTC+5 (соответствует
+                                              # 5:00 / 12:00 / 16:00 / 20:00 МСК)
+TRADE_SIGNAL_TICKERS = ["BTC", "ETH", "LINK"]
 
 def calc_atr(rows, period=14):
     """ATR по списку свечей [start, open, high, low, close, volume, turnover] —
@@ -2130,14 +2135,15 @@ def build_trade_levels(metrics, rows_4h):
         "cur_price": cur_price,
     }
 
-def build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summary):
-    """Промпт для решения long/short/нет сигнала. Числа даны Opus только как контекст
-    для принятия решения — сама карточка с цифрами (вход/стоп/тейк/R:R) собирается
-    кодом Python отдельно из levels, НЕ из ответа модели. Поэтому от Opus нужен
-    ТОЛЬКО чистый вердикт + короткое текстовое обоснование БЕЗ повторения цифр —
-    цифры в ответе не нужны и могут разъехаться с реальными levels."""
+def build_trade_signal_prompt(ticker_label, metrics, levels, rows_4h_tail, news, whale_summary, volume_summary):
+    """Промпт для решения long/short/нет сигнала по указанному тикеру. Числа даны
+    Opus только как контекст для принятия решения — сама карточка с цифрами
+    (вход/стоп/тейк/R:R) собирается кодом Python отдельно из levels, НЕ из ответа
+    модели. Поэтому от Opus нужен ТОЛЬКО чистый вердикт + короткое текстовое
+    обоснование БЕЗ повторения цифр — цифры в ответе не нужны и могут разъехаться
+    с реальными levels."""
     system_prompt = (
-        "Ты — крипто-трейдер, принимающий решение о конкретной сделке по BTC для "
+        "Ты — крипто-трейдер, принимающий решение о конкретной сделке по " + ticker_label + " для "
         "приватного Telegram-канала. У тебя есть ДВА готовых набора уровней (long и "
         "short, посчитаны точно по формуле) — они показаны тебе только для контекста "
         "принятия решения, HE вставляй их числа в свой ответ, они будут добавлены "
@@ -2149,40 +2155,41 @@ def build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summa
         "лучше промолчать, чем дать слабый сигнал.\n\n"
         "Формат ответа СТРОГО, ровно два элемента, без цифр уровней в тексте:\n"
         "Строка 1: одно слово — LONG, SHORT или НЕТ_СИГНАЛА\n"
-        "Строка 2 и далее: 2-3 коротких предложения обоснования (простой текст, "
+        "Строка 2 и далее: 1-2 коротких предложения обоснования (простой текст, "
         "без HTML-тегов, без markdown, без упоминания конкретных цифр входа/стопа/"
-        "тейка — только качественное обоснование: тренд, объём, новости, риски)."
+        "тейка — только качественное обоснование: тренд, объём, новости, риски). "
+        "Держи ответ КОРОТКИМ — это один из нескольких тикеров в общей сводке."
     )
 
     lines = []
-    lines.append("ТЕКУЩАЯ ЦЕНА: $" + "{:,.0f}".format(metrics["price"]))
-    if metrics["ema50"]:
-        lines.append("EMA50 (4ч): $" + "{:,.0f}".format(metrics["ema50"]))
-    if metrics["ema200"]:
-        lines.append("EMA200 (4ч): $" + "{:,.0f}".format(metrics["ema200"]))
-    if metrics["rsi14"] is not None:
+    lines.append("ТЕКУЩАЯ ЦЕНА " + ticker_label + ": $" + "{:,.4g}".format(metrics["price"]))
+    if metrics.get("ema50"):
+        lines.append("EMA50 (4ч): $" + "{:,.4g}".format(metrics["ema50"]))
+    if metrics.get("ema200"):
+        lines.append("EMA200 (4ч): $" + "{:,.4g}".format(metrics["ema200"]))
+    if metrics.get("rsi14") is not None:
         lines.append("RSI(14) на 4ч: " + "{:.1f}".format(metrics["rsi14"]))
     lines.append("Объём текущего 4ч бара к среднему: ×" + "{:.2f}".format(metrics["vol_ratio"]))
-    lines.append("ATR(14, 4ч): $" + "{:,.0f}".format(levels["atr"]))
+    lines.append("ATR(14, 4ч): $" + "{:,.4g}".format(levels["atr"]))
 
     lines.append("")
     lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ LONG (посчитан точно, не меняй числа):")
-    lines.append("Вход: $" + "{:,.0f}".format(levels["long"]["entry"]))
-    lines.append("Стоп: $" + "{:,.0f}".format(levels["long"]["stop"]))
-    lines.append("Тейк: $" + "{:,.0f}".format(levels["long"]["take"]))
+    lines.append("Вход: $" + "{:,.4g}".format(levels["long"]["entry"]))
+    lines.append("Стоп: $" + "{:,.4g}".format(levels["long"]["stop"]))
+    lines.append("Тейк: $" + "{:,.4g}".format(levels["long"]["take"]))
     if levels["long"]["rr"]:
         lines.append("R:R: 1:" + "{:.1f}".format(levels["long"]["rr"]))
 
     lines.append("")
     lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ SHORT (посчитан точно, не меняй числа):")
-    lines.append("Вход: $" + "{:,.0f}".format(levels["short"]["entry"]))
-    lines.append("Стоп: $" + "{:,.0f}".format(levels["short"]["stop"]))
-    lines.append("Тейк: $" + "{:,.0f}".format(levels["short"]["take"]))
+    lines.append("Вход: $" + "{:,.4g}".format(levels["short"]["entry"]))
+    lines.append("Стоп: $" + "{:,.4g}".format(levels["short"]["stop"]))
+    lines.append("Тейк: $" + "{:,.4g}".format(levels["short"]["take"]))
     if levels["short"]["rr"]:
         lines.append("R:R: 1:" + "{:.1f}".format(levels["short"]["rr"]))
 
     lines.append("")
-    lines.append("СВЕЖИЕ НОВОСТИ:")
+    lines.append("СВЕЖИЕ НОВОСТИ (общий крипторынок):")
     if news:
         for h in news:
             lines.append("- " + h)
@@ -2198,7 +2205,7 @@ def build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summa
 
     lines.append("")
     lines.append("ИСТОРИЯ СВЕЧЕЙ 4ч (последние ~7 дней, [время,open,high,low,close,volume]):")
-    for row in metrics["rows_4h_tail"]:
+    for row in rows_4h_tail:
         lines.append(str(row[:6]))
 
     user_prompt = "\n".join(lines)
@@ -2220,54 +2227,88 @@ def parse_trade_decision(raw_text):
     reasoning = "\n".join(lines[1:]).strip()
     return decision, reasoning
 
-def run_trade_signal(send=True):
-    """Полный проход торгового модуля: метрики -> уровни по формуле -> решение Opus
-    (LONG/SHORT/нет сигнала) -> карточка с цифрами собирается кодом Python из levels
-    (не из текста модели) -> отправка. Возвращает (text, error)."""
-    metrics = build_btc_metrics()
-    if metrics is None:
-        return None, "Не удалось получить достаточно свечей BTC с Bybit"
+def run_single_ticker_signal(coin):
+    """Полный проход торгового модуля для ОДНОГО тикера: резолв символа -> свечи ->
+    метрики -> уровни по формуле -> решение Opus (LONG/SHORT/нет сигнала) ->
+    готовый текстовый блок для вставки в общее мультитикерное сообщение.
+    Возвращает (block_text, error). Карточка с цифрами собирается кодом Python
+    из levels, не из текста модели — та же архитектура, что и раньше для BTC."""
+    symbol, category = resolve_symbol_and_category(coin)
+    if not symbol:
+        return None, "Тикер '" + coin + "' не найден на Bybit"
 
-    rows_4h = get_btc_klines("240", 200)
+    rows_4h = get_klines_universal(symbol, category, "240", limit=200)
+    if len(rows_4h) < 60:
+        return None, "Недостаточно данных по свечам для " + symbol
+
+    metrics = build_universal_metrics(rows_4h)
+    if metrics is None:
+        return None, "Не удалось посчитать метрики для " + symbol
+
     levels = build_trade_levels(metrics, rows_4h)
     if levels is None:
-        return None, "Не удалось посчитать уровни (нет ATR или уровней поддержки/сопротивления)"
+        return None, "Не удалось посчитать уровни для " + symbol + " (нет ATR или уровней поддержки/сопротивления)"
 
     news = get_crypto_news_headlines()
-    whale_summary = get_last_whale_summary_text()
-    volume_summary = get_last_volume_summary_text()
+    whale_summary = get_last_whale_summary_text(coin)
+    volume_summary = get_last_volume_summary_text(coin)
+    rows_4h_tail = rows_4h[-42:]   # последние ~7 дней для контекста истории
 
-    system_prompt, user_prompt = build_trade_signal_prompt(metrics, levels, news, whale_summary, volume_summary)
-    raw_text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=1000)
+    system_prompt, user_prompt = build_trade_signal_prompt(coin, metrics, levels, rows_4h_tail, news, whale_summary, volume_summary)
+    raw_text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=500)
     if error:
         return None, error
 
     decision, reasoning = parse_trade_decision(raw_text)
 
-    line = "------------------------------"
     if decision in ("LONG", "SHORT"):
         lv = levels["long"] if decision == "LONG" else levels["short"]
         dir_emoji = "&#128994;" if decision == "LONG" else "&#128308;"
         rr_text = "1:" + "{:.1f}".format(lv["rr"]) if lv["rr"] else "н/д"
-        body = (
-            dir_emoji + " <b>" + decision + "</b>\n"
-            + "Вход: $" + "{:,.0f}".format(lv["entry"]) + "\n"
-            + "Стоп: $" + "{:,.0f}".format(lv["stop"]) + "\n"
-            + "Тейк: $" + "{:,.0f}".format(lv["take"]) + "\n"
-            + "R:R: " + rr_text + "\n\n"
+        block = (
+            "<b>" + coin + "</b>\n"
+            + dir_emoji + " <b>" + decision + "</b>\n"
+            + "Вход: $" + "{:,.4g}".format(lv["entry"]) + "\n"
+            + "Стоп: $" + "{:,.4g}".format(lv["stop"]) + "\n"
+            + "Тейк: $" + "{:,.4g}".format(lv["take"]) + "\n"
+            + "R:R: " + rr_text + "\n"
             + "Обоснование: " + reasoning
         )
     else:
-        body = (
-            "&#9898; <b>СИГНАЛА НЕТ</b>\n\n"
+        block = (
+            "<b>" + coin + "</b>\n"
+            + "&#9898; <b>СИГНАЛА НЕТ</b>\n"
             + "Обоснование: " + (reasoning or "Ситуация неоднозначная.")
         )
 
+    return block, None
+
+def run_trade_signal(send=True):
+    """Проходит по всем тикерам из TRADE_SIGNAL_TICKERS (BTC, ETH, LINK), собирает
+    каждый блок через run_single_ticker_signal и объединяет в ОДНО сообщение.
+    Если по какому-то тикеру произошла ошибка — в его блоке будет короткая пометка
+    об ошибке, остальные тикеры это не блокирует. Возвращает (text, error) —
+    error не None только если ВСЕ тикеры не удалось обработать."""
+    blocks = []
+    any_success = False
+    for coin in TRADE_SIGNAL_TICKERS:
+        block, error = run_single_ticker_signal(coin)
+        if block:
+            blocks.append(block)
+            any_success = True
+        else:
+            blocks.append("<b>" + coin + "</b>\n&#9888; " + (error or "неизвестная ошибка"))
+
+    if not any_success:
+        return None, "Не удалось получить сигнал ни по одному тикеру: " + "; ".join(blocks)
+
+    line = "------------------------------"
+    separator = "\n" + line + "\n"
     full_text = (
-        "&#127919; <b>ТОРГОВЫЙ СИГНАЛ BTC</b>\n"
+        "&#127919; <b>ТОРГОВЫЙ СИГНАЛ</b>\n"
         + datetime.now().strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
         + line + "\n"
-        + body + "\n"
+        + separator.join(blocks) + "\n"
         + line + "\n"
         + "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"
     )
@@ -2279,8 +2320,9 @@ def run_trade_signal(send=True):
 
 def trade_signal_loop():
     """Фоновый поток: проверяет каждую минуту, не наступил ли один из часов
-    TRADE_SIGNAL_HOURS_UTC5 (6:00 или 18:00) — и если да, запускает сигнал один раз
-    за эту минуту (защита от повторной отправки внутри той же минуты через флаг)."""
+    TRADE_SIGNAL_HOURS_UTC5 (7:00 / 14:00 / 18:00 / 22:00, UTC+5) — и если да,
+    запускает мультитикерный сигнал один раз за эту минуту (защита от повторной
+    отправки внутри той же минуты через флаг)."""
     last_sent_key = None
     while True:
         try:
@@ -2371,7 +2413,13 @@ def resolve_symbol_and_category(ticker_raw):
     ошибку с регистром ещё раз, если формат для какого-то конкретного тикера
     вдруг будет отличаться."""
     base = ticker_raw.replace("USDT", "").replace("USD", "")
+    # Пользователь может написать как короткое имя ("AAPL"), так и полный
+    # реальный тикер xStocks с суффиксом ("AAPLXUSDT" -> после снятия USDT
+    # остаётся "AAPLX") — проверяем оба варианта.
+    base_no_x = base[:-1] if base.endswith("X") and base[:-1] in XSTOCKS_TICKERS else base
 
+    if base_no_x in XSTOCKS_TICKERS:
+        base = base_no_x
     if base in XSTOCKS_TICKERS:
         stock_candidate = base + "X" + "USDT"
         try:
