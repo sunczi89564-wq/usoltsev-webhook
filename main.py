@@ -716,6 +716,21 @@ def send_telegram(text, thread_id=None):
         payload["message_thread_id"] = thread_id
     requests.post(url, json=payload)
 
+def send_telegram_ex(text, thread_id=None, reply_to=None):
+    """То же, что send_telegram, но возвращает message_id отправленного сообщения
+    и умеет отвечать на сообщение (reply_to) — нужно для уведомлений о закрытии сигнала."""
+    url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
+    payload = {"chat_id": GROUP_CHAT_ID, "text": text, "parse_mode": "HTML"}
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
+    if reply_to:
+        payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
+    try:
+        r = requests.post(url, json=payload, timeout=15).json()
+        return r.get("result", {}).get("message_id")
+    except:
+        return None
+
 # ═══════════════════════════════════════════════
 # БУФЕР СИГНАЛОВ
 # ═══════════════════════════════════════════════
@@ -1290,6 +1305,13 @@ def telegram_updates():
         send_telegram(format_stats("НЕДЕЛЯ", 24 * 7, tf_filter), thread_id)
     elif text.startswith("/statsmonth"):
         send_telegram(format_stats("МЕСЯЦ", 24 * 30, tf_filter), thread_id)
+    elif text.startswith("/signalstats"):
+        # /signalstats — за 7 дней, /signalstats 30 — за 30 дней
+        parts = text.split()
+        days = 7
+        if len(parts) > 1 and parts[1].isdigit():
+            days = max(1, min(int(parts[1]), 90))
+        send_telegram(format_signal_report(days), thread_id)
     elif thread_id == THREAD_ASK_ANALYSIS and not text.startswith("/"):
         # Любое сообщение (не команда) в теме Ask Analysis трактуется как запрос
         # на анализ. Запускаем в отдельном потоке, чтобы не блокировать webhook
@@ -2178,7 +2200,11 @@ def find_next_level(rows, ref_price, direction, lookback=120):
 def build_trade_levels(metrics, rows_4h):
     """Считает конкретные торговые уровни ТОЧНО по формуле для обоих направлений
     (long и short) — Opus далее выберет, какое (если любое) обосновано, но сами
-    числа фиксированы кодом, не моделью."""
+    числа фиксированы кодом, не моделью.
+    Стоп = самый ДАЛЬНИЙ из трёх вариантов (чтобы в тихом рынке его не выбивало шумом):
+      1) за уровнем на STOP_LEVEL_ATR × ATR,
+      2) от входа на STOP_MIN_ATR × ATR,
+      3) от входа минимум на STOP_MIN_PCT % цены."""
     atr = calc_atr(rows_4h, 14)
     if atr is None or not metrics.get("support") or not metrics.get("resistance"):
         return None
@@ -2187,22 +2213,24 @@ def build_trade_levels(metrics, rows_4h):
     resistance = metrics["resistance"]
     cur_price = metrics["price"]
 
-    # LONG: вход в зоне поддержки (небольшой буфер внутрь диапазона), стоп ниже
-    # поддержки на 0.5 ATR, тейк — следующий уровень сопротивления дальше по цепочке,
-    # либо R:R 1:2 как запасной вариант, если следующего уровня не нашлось.
+    # LONG: вход у поддержки, стоп ниже
     long_entry = support + atr * 0.1
-    long_stop  = support - atr * 0.5
+    long_stop  = min(support - atr * STOP_LEVEL_ATR,
+                     long_entry - atr * STOP_MIN_ATR,
+                     long_entry * (1 - STOP_MIN_PCT / 100.0))
     long_risk  = long_entry - long_stop
     long_next_level = find_next_level(rows_4h, resistance, "up")
-    long_take = long_next_level if long_next_level else long_entry + long_risk * 2
+    long_take = long_next_level if long_next_level and long_next_level > long_entry else long_entry + long_risk * 2
     long_rr = (long_take - long_entry) / long_risk if long_risk > 0 else None
 
     # SHORT: зеркально у сопротивления
     short_entry = resistance - atr * 0.1
-    short_stop  = resistance + atr * 0.5
+    short_stop  = max(resistance + atr * STOP_LEVEL_ATR,
+                      short_entry + atr * STOP_MIN_ATR,
+                      short_entry * (1 + STOP_MIN_PCT / 100.0))
     short_risk  = short_stop - short_entry
     short_next_level = find_next_level(rows_4h, support, "down")
-    short_take = short_next_level if short_next_level else short_entry - short_risk * 2
+    short_take = short_next_level if short_next_level and short_next_level < short_entry else short_entry - short_risk * 2
     short_rr = (short_entry - short_take) / short_risk if short_risk > 0 else None
 
     return {
@@ -2212,30 +2240,128 @@ def build_trade_levels(metrics, rows_4h):
         "cur_price": cur_price,
     }
 
-def build_trade_signal_prompt(ticker_label, metrics, levels, rows_4h_tail, news, whale_summary, volume_summary):
-    """Промпт для решения long/short/нет сигнала по указанному тикеру. Числа даны
-    Opus только как контекст для принятия решения — сама карточка с цифрами
-    (вход/стоп/тейк/R:R) собирается кодом Python отдельно из levels, НЕ из ответа
-    модели. Поэтому от Opus нужен ТОЛЬКО чистый вердикт + короткое текстовое
-    обоснование БЕЗ повторения цифр — цифры в ответе не нужны и могут разъехаться
-    с реальными levels."""
+# ═══════════════════════════════════════════════
+# ПОЗИЦИОНИРОВАНИЕ ТОЛПЫ (Bybit, бесплатно): funding, OI, long/short ratio
+# ═══════════════════════════════════════════════
+def get_crowd_data(symbol, category):
+    """Возвращает dict с funding (%), oi_change_24h (%), ls_ratio (лонги/шорты по аккаунтам)
+    или None, если инструмент не перпетуал / данные недоступны. Любое поле может быть None."""
+    if category != "linear":
+        return None
+    out = {"funding": None, "oi_change_24h": None, "ls_ratio": None}
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=" + symbol, timeout=8).json()
+        lst = r.get("result", {}).get("list", [])
+        if lst and lst[0].get("fundingRate") not in (None, ""):
+            out["funding"] = float(lst[0]["fundingRate"]) * 100
+    except:
+        pass
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/open-interest?category=linear&symbol=" + symbol
+                         + "&intervalTime=1h&limit=25", timeout=8).json()
+        lst = r.get("result", {}).get("list", [])   # от новых к старым
+        if len(lst) >= 25:
+            now_oi = float(lst[0]["openInterest"])
+            old_oi = float(lst[24]["openInterest"])
+            if old_oi > 0:
+                out["oi_change_24h"] = (now_oi - old_oi) / old_oi * 100
+    except:
+        pass
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/account-ratio?category=linear&symbol=" + symbol
+                         + "&period=1h&limit=1", timeout=8).json()
+        lst = r.get("result", {}).get("list", [])
+        if lst:
+            buy = float(lst[0]["buyRatio"])
+            sell = float(lst[0]["sellRatio"])
+            if sell > 0:
+                out["ls_ratio"] = buy / sell
+    except:
+        pass
+    return out
+
+def format_crowd_line(crowd):
+    if not crowd:
+        return None
+    parts = []
+    if crowd.get("funding") is not None:
+        f = crowd["funding"]
+        who = "лонги платят" if f > 0 else ("шорты платят" if f < 0 else "нейтрально")
+        parts.append("funding " + "{:+.4f}".format(f) + "% (" + who + ")")
+    if crowd.get("oi_change_24h") is not None:
+        parts.append("OI " + "{:+.1f}".format(crowd["oi_change_24h"]) + "%/24ч")
+    if crowd.get("ls_ratio") is not None:
+        parts.append("Long/Short " + "{:.2f}".format(crowd["ls_ratio"]))
+    return " · ".join(parts) if parts else None
+
+# ═══════════════════════════════════════════════
+# РИСК-БЛОК: объём позиции и максимальное плечо под депозит
+# ═══════════════════════════════════════════════
+RISK_PCT        = 3.0     # риск на сделку, % депозита
+STOP_LEVEL_ATR  = 0.5     # стоп за уровнем, × ATR
+STOP_MIN_ATR    = 1.0     # минимальное расстояние стопа от входа, × ATR
+STOP_MIN_PCT    = 0.6     # минимальное расстояние стопа от входа, % цены
+LIQ_SAFETY      = 1.5     # ликвидация должна быть дальше стопа минимум в 1.5 раза
+
+def maint_margin_rate(coin):
+    """Поддерживающая маржа Bybit (первый тир): ~0.5% для BTC/ETH, у альтов обычно выше —
+    берём 1% с запасом."""
+    return 0.005 if coin in ("BTC", "ETH") else 0.01
+
+def calc_risk_block(coin, direction, entry, stop):
+    stop_pct = abs(entry - stop) / entry
+    if stop_pct <= 0:
+        return None
+    risk_usd = DEPOSIT * RISK_PCT / 100.0
+    notional = risk_usd / stop_pct
+    mmr = maint_margin_rate(coin)
+    max_lev = int(1.0 / (LIQ_SAFETY * stop_pct + mmr))
+    max_lev = max(1, min(max_lev, LEVERAGE))
+    margin = notional / max_lev
+    if direction == "LONG":
+        liq = entry * (1 - 1.0 / max_lev + mmr)
+    else:
+        liq = entry * (1 + 1.0 / max_lev - mmr)
+    return {"stop_pct": stop_pct * 100, "risk_usd": risk_usd, "notional": notional,
+            "max_lev": max_lev, "margin": margin, "liq": liq, "enough": margin <= DEPOSIT}
+
+# ═══════════════════════════════════════════════
+# СРОК ДЕЙСТВИЯ СИГНАЛА: до следующего планового сигнала
+# ═══════════════════════════════════════════════
+def next_signal_time(now):
+    cands = []
+    for day in (0, 1, 2):
+        base = (now + timedelta(days=day)).replace(minute=0, second=0, microsecond=0)
+        for h in TRADE_SIGNAL_HOURS_DUBAI:
+            t = base.replace(hour=h)
+            if t > now + timedelta(minutes=5):
+                cands.append(t)
+    return min(cands)
+
+def build_trade_signal_prompt(ticker_label, metrics, levels, rows_4h_tail, news, whale_summary, volume_summary, crowd=None):
+    """Промпт для решения long/short/нет сигнала. Числа уровней даны Opus только как
+    контекст — карточка с цифрами собирается кодом Python из levels."""
     system_prompt = (
         "Ты — крипто-трейдер, принимающий решение о конкретной сделке по " + ticker_label + " для "
         "приватного Telegram-канала. У тебя есть ДВА готовых набора уровней (long и "
-        "short, посчитаны точно по формуле) — они показаны тебе только для контекста "
-        "принятия решения, HE вставляй их числа в свой ответ, они будут добавлены "
-        "отдельно кодом. Выбери один из трёх вариантов:\n"
+        "short, посчитаны точно по формуле) — они показаны только для контекста, "
+        "НЕ вставляй числа входа/стопа/тейка в обоснование, они будут добавлены кодом. "
+        "Выбери один из трёх вариантов:\n"
         "1) LONG — если контекст ясно говорит в пользу покупки у поддержки.\n"
         "2) SHORT — если контекст ясно говорит в пользу продажи у сопротивления.\n"
-        "3) НЕТ СИГНАЛА — если ситуация неоднозначная, противоречивая, или ни один "
-        "сценарий не выглядит явно предпочтительным. НЕ бойся выбрать этот вариант — "
-        "лучше промолчать, чем дать слабый сигнал.\n\n"
-        "Формат ответа СТРОГО, ровно два элемента, без цифр уровней в тексте:\n"
+        "3) НЕТ_СИГНАЛА — если ситуация неоднозначная или R:R слабый. Лучше промолчать, "
+        "чем дать слабый сигнал.\n\n"
+        "Учитывай позиционирование толпы: сильный положительный funding + высокий Long/Short = "
+        "толпа в лонгах, риск каскада ликвидаций вниз; сильный отрицательный funding = толпа в "
+        "шортах, риск шорт-сквиза. Рост OI вместе с движением цены подтверждает движение, рост OI "
+        "против движения — набор позиций против тренда.\n\n"
+        "Формат ответа СТРОГО:\n"
         "Строка 1: одно слово — LONG, SHORT или НЕТ_СИГНАЛА\n"
-        "Строка 2 и далее: 1-2 коротких предложения обоснования (простой текст, "
-        "без HTML-тегов, без markdown, без упоминания конкретных цифр входа/стопа/"
-        "тейка — только качественное обоснование: тренд, объём, новости, риски). "
-        "Держи ответ КОРОТКИМ — это один из нескольких тикеров в общей сводке."
+        "Строка 2: УВЕРЕННОСТЬ: число от 1 до 5 (1 — слабый сигнал, 5 — очень сильный; для НЕТ_СИГНАЛА — 0)\n"
+        "Строка 3: ОТМЕНА: одно короткое условие, при котором сигнал теряет смысл "
+        "(например закрытие 4ч выше/ниже уровня; здесь можно указать цену из данных). Для НЕТ_СИГНАЛА — ОТМЕНА: -\n"
+        "Строка 4 и далее: 1-2 коротких предложения обоснования (простой текст, без HTML и markdown, "
+        "без цифр входа/стопа/тейка)."
     )
 
     lines = []
@@ -2249,21 +2375,19 @@ def build_trade_signal_prompt(ticker_label, metrics, levels, rows_4h_tail, news,
     lines.append("Объём текущего 4ч бара к среднему: ×" + "{:.2f}".format(metrics["vol_ratio"]))
     lines.append("ATR(14, 4ч): $" + fmt_price(levels["atr"]))
 
-    lines.append("")
-    lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ LONG (посчитан точно, не меняй числа):")
-    lines.append("Вход: $" + fmt_price(levels["long"]["entry"]))
-    lines.append("Стоп: $" + fmt_price(levels["long"]["stop"]))
-    lines.append("Тейк: $" + fmt_price(levels["long"]["take"]))
-    if levels["long"]["rr"]:
-        lines.append("R:R: 1:" + "{:.1f}".format(levels["long"]["rr"]))
+    for side, label in (("long", "LONG"), ("short", "SHORT")):
+        lv = levels[side]
+        lines.append("")
+        lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ " + label + " (посчитан точно, не меняй числа):")
+        lines.append("Вход: $" + fmt_price(lv["entry"]))
+        lines.append("Стоп: $" + fmt_price(lv["stop"]))
+        lines.append("Тейк: $" + fmt_price(lv["take"]))
+        if lv["rr"]:
+            lines.append("R:R: 1:" + "{:.1f}".format(lv["rr"]))
 
+    crowd_line = format_crowd_line(crowd)
     lines.append("")
-    lines.append("ГОТОВЫЙ НАБОР УРОВНЕЙ SHORT (посчитан точно, не меняй числа):")
-    lines.append("Вход: $" + fmt_price(levels["short"]["entry"]))
-    lines.append("Стоп: $" + fmt_price(levels["short"]["stop"]))
-    lines.append("Тейк: $" + fmt_price(levels["short"]["take"]))
-    if levels["short"]["rr"]:
-        lines.append("R:R: 1:" + "{:.1f}".format(levels["short"]["rr"]))
+    lines.append("ПОЗИЦИОНИРОВАНИЕ ТОЛПЫ (Bybit): " + (crowd_line or "нет данных"))
 
     lines.append("")
     lines.append("СВЕЖИЕ НОВОСТИ (общий крипторынок):")
@@ -2285,15 +2409,13 @@ def build_trade_signal_prompt(ticker_label, metrics, levels, rows_4h_tail, news,
     for row in rows_4h_tail:
         lines.append(str(row[:6]))
 
-    user_prompt = "\n".join(lines)
-    return system_prompt, user_prompt
+    return system_prompt, "\n".join(lines)
 
 def parse_trade_decision(raw_text):
-    """Разбирает ответ Opus: первая непустая строка = решение (LONG/SHORT/НЕТ_СИГНАЛА
-    в любом регистре, с пробелом или подчёркиванием), остальное = обоснование."""
+    """Разбирает ответ Opus: решение, уверенность (0-5), условие отмены, обоснование."""
     lines = [l.strip() for l in raw_text.strip().split("\n") if l.strip()]
     if not lines:
-        return "НЕТ_СИГНАЛА", ""
+        return "НЕТ_СИГНАЛА", 0, "", ""
     first = lines[0].upper().replace(" ", "_").replace("-", "_")
     if "LONG" in first:
         decision = "LONG"
@@ -2301,78 +2423,130 @@ def parse_trade_decision(raw_text):
         decision = "SHORT"
     else:
         decision = "НЕТ_СИГНАЛА"
-    reasoning = "\n".join(lines[1:]).strip()
-    return decision, reasoning
+    conf = 0
+    cancel = ""
+    rest = []
+    for l in lines[1:]:
+        up = l.upper()
+        if up.startswith("УВЕРЕННОСТЬ"):
+            digits = [c for c in l if c.isdigit()]
+            if digits:
+                conf = max(0, min(5, int(digits[0])))
+        elif up.startswith("ОТМЕНА"):
+            cancel = l.split(":", 1)[1].strip() if ":" in l else ""
+            if cancel in ("-", "—"):
+                cancel = ""
+        else:
+            rest.append(l)
+    if decision != "НЕТ_СИГНАЛА" and conf == 0:
+        conf = 3
+    return decision, conf, cancel, "\n".join(rest).strip()
 
-def run_single_ticker_signal(coin):
-    """Полный проход торгового модуля для ОДНОГО тикера: резолв символа -> свечи ->
-    метрики -> уровни по формуле -> решение Opus (LONG/SHORT/нет сигнала) ->
-    готовый текстовый блок для вставки в общее мультитикерное сообщение.
-    Возвращает (block_text, error). Карточка с цифрами собирается кодом Python
-    из levels, не из текста модели — та же архитектура, что и раньше для BTC."""
+def conf_dots(conf):
+    return "●" * conf + "○" * (5 - conf)
+
+def run_single_ticker_signal(coin, expires_at=None):
+    """Полный проход торгового модуля для ОДНОГО тикера. Возвращает
+    (block_text, error, record) — record (dict для учёта результатов) только для LONG/SHORT."""
     symbol, category = resolve_symbol_and_category(coin)
     if not symbol:
-        return None, "Тикер '" + coin + "' не найден на Bybit"
+        return None, "Тикер '" + coin + "' не найден на Bybit", None
 
     rows_4h = get_klines_universal(symbol, category, "240", limit=200)
     if len(rows_4h) < 60:
-        return None, "Недостаточно данных по свечам для " + symbol
+        return None, "Недостаточно данных по свечам для " + symbol, None
 
     metrics = build_universal_metrics(rows_4h)
     if metrics is None:
-        return None, "Не удалось посчитать метрики для " + symbol
+        return None, "Не удалось посчитать метрики для " + symbol, None
 
     levels = build_trade_levels(metrics, rows_4h)
     if levels is None:
-        return None, "Не удалось посчитать уровни для " + symbol + " (нет ATR или уровней поддержки/сопротивления)"
+        return None, "Не удалось посчитать уровни для " + symbol + " (нет ATR или уровней поддержки/сопротивления)", None
 
     news = get_crypto_news_headlines()
     whale_summary = get_last_whale_summary_text(coin)
     volume_summary = get_last_volume_summary_text(coin)
-    rows_4h_tail = rows_4h[-42:]   # последние ~7 дней для контекста истории
+    crowd = get_crowd_data(symbol, category)
+    rows_4h_tail = rows_4h[-42:]
 
-    system_prompt, user_prompt = build_trade_signal_prompt(coin, metrics, levels, rows_4h_tail, news, whale_summary, volume_summary)
-    raw_text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=500)
+    system_prompt, user_prompt = build_trade_signal_prompt(coin, metrics, levels, rows_4h_tail, news,
+                                                           whale_summary, volume_summary, crowd)
+    raw_text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=600)
     if error:
-        return None, error
+        return None, error, None
 
-    decision, reasoning = parse_trade_decision(raw_text)
+    decision, conf, cancel, reasoning = parse_trade_decision(raw_text)
+    crowd_line = format_crowd_line(crowd)
 
     if decision in ("LONG", "SHORT"):
         lv = levels["long"] if decision == "LONG" else levels["short"]
         dir_emoji = "&#128994;" if decision == "LONG" else "&#128308;"
         rr_text = "1:" + "{:.1f}".format(lv["rr"]) if lv["rr"] else "н/д"
-        block = (
-            "<b>" + coin + "</b>\n"
-            + dir_emoji + " <b>" + decision + "</b>\n"
-            + "Вход: $" + fmt_price(lv["entry"]) + "\n"
-            + "Стоп: $" + fmt_price(lv["stop"]) + "\n"
-            + "Тейк: $" + fmt_price(lv["take"]) + "\n"
-            + "R:R: " + rr_text + "\n"
-            + "Обоснование: " + reasoning
-        )
-    else:
-        block = (
-            "<b>" + coin + "</b>\n"
-            + "&#9898; <b>СИГНАЛА НЕТ</b>\n"
-            + "Обоснование: " + (reasoning or "Ситуация неоднозначная.")
-        )
+        stop_pct = abs(lv["stop"] - lv["entry"]) / lv["entry"] * 100
+        take_pct = abs(lv["take"] - lv["entry"]) / lv["entry"] * 100
+        stop_atr = abs(lv["stop"] - lv["entry"]) / levels["atr"] if levels["atr"] else 0
+        stop_sign = "-" if decision == "LONG" else "+"
+        take_sign = "+" if decision == "LONG" else "-"
+        rb = calc_risk_block(coin, decision, lv["entry"], lv["stop"])
 
-    return block, None
+        block = (
+            "<b>" + coin + "</b>\n"
+            + dir_emoji + " <b>" + decision + "</b> · уверенность " + conf_dots(conf) + "\n"
+            + "Вход: $" + fmt_price(lv["entry"]) + "\n"
+            + "Стоп: $" + fmt_price(lv["stop"]) + "  (" + stop_sign + "{:.2f}".format(stop_pct) + "% · "
+            + "{:.1f}".format(stop_atr) + "×ATR)\n"
+            + "Тейк: $" + fmt_price(lv["take"]) + "  (" + take_sign + "{:.2f}".format(take_pct) + "%)\n"
+            + "R:R: " + rr_text + "\n"
+        )
+        if rb:
+            block += (
+                "Риск-блок ($" + "{:.0f}".format(DEPOSIT) + ", риск " + "{:g}".format(RISK_PCT) + "% = $"
+                + "{:.0f}".format(rb["risk_usd"]) + "):\n"
+                + "  объём $" + "{:,.0f}".format(rb["notional"]) + " · маржа $" + "{:,.0f}".format(rb["margin"])
+                + " при x" + str(rb["max_lev"]) + "\n"
+                + "  макс. плечо x" + str(rb["max_lev"]) + " (ликвидация ~$" + fmt_price(rb["liq"]) + " — за стопом)\n"
+            )
+            if not rb["enough"]:
+                block += "  &#9888; маржи больше депозита — уменьши риск или пропусти сделку\n"
+        if crowd_line:
+            block += "Толпа: " + crowd_line + "\n"
+        if cancel:
+            block += "Отмена: " + cancel + "\n"
+        if expires_at:
+            block += "Актуален до: " + expires_at.strftime("%H:%M") + "\n"
+        block += "Обоснование: " + reasoning
+
+        record = {
+            "coin": coin, "symbol": symbol, "category": category, "dir": decision,
+            "entry": lv["entry"], "stop": lv["stop"], "take": lv["take"], "rr": lv["rr"],
+            "conf": conf,
+        }
+        return block, None, record
+
+    block = (
+        "<b>" + coin + "</b>\n"
+        + "&#9898; <b>СИГНАЛА НЕТ</b>\n"
+        + ("Толпа: " + crowd_line + "\n" if crowd_line else "")
+        + "Обоснование: " + (reasoning or "Ситуация неоднозначная.")
+    )
+    return block, None, None
 
 def run_trade_signal(send=True):
-    """Проходит по всем тикерам из TRADE_SIGNAL_TICKERS (BTC, ETH, LINK), собирает
-    каждый блок через run_single_ticker_signal и объединяет в ОДНО сообщение.
-    Если по какому-то тикеру произошла ошибка — в его блоке будет короткая пометка
-    об ошибке, остальные тикеры это не блокирует. Возвращает (text, error) —
-    error не None только если ВСЕ тикеры не удалось обработать."""
+    """Проходит по TRADE_SIGNAL_TICKERS, собирает одно сообщение, при send=True
+    отправляет его и ставит LONG/SHORT-сигналы на учёт результатов."""
+    now = now_local()
+    expires_at = next_signal_time(now)
     blocks = []
+    records = []
     any_success = False
     for coin in TRADE_SIGNAL_TICKERS:
-        block, error = run_single_ticker_signal(coin)
+        block, error, record = run_single_ticker_signal(coin, expires_at)
         if block:
             blocks.append(block)
             any_success = True
+            if record:
+                records.append(record)
         else:
             blocks.append("<b>" + coin + "</b>\n&#9888; " + (error or "неизвестная ошибка"))
 
@@ -2381,19 +2555,259 @@ def run_trade_signal(send=True):
 
     line = "------------------------------"
     separator = "\n" + line + "\n"
+    footer_warn = ""
+    dirs = [r["dir"] for r in records]
+    if len(dirs) >= 2 and len(set(dirs)) == 1:
+        word = "LONG" if dirs[0] == "LONG" else "SHORT"
+        footer_warn = ("&#9888; Все " + str(len(dirs)) + " сигнала " + word
+                       + " — по сути одна ставка на " + ("рост" if word == "LONG" else "падение")
+                       + " рынка, риск ×" + str(len(dirs)) + ".\n")
+
     full_text = (
         "&#127919; <b>ТОРГОВЫЙ СИГНАЛ</b>\n"
-        + now_local().strftime("%d.%m.%Y  %H:%M") + " " + DUBAI_LABEL + "\n"
+        + now.strftime("%d.%m.%Y  %H:%M") + " " + DUBAI_LABEL + "\n"
         + line + "\n"
         + separator.join(blocks) + "\n"
         + line + "\n"
+        + footer_warn
         + "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"
     )
 
     if send:
-        send_telegram(full_text, THREAD_GENERAL)
+        msg_id = send_telegram_ex(full_text, THREAD_GENERAL)
+        if records:
+            register_signals(records, msg_id, now, expires_at)
 
     return full_text, None
+
+# ═══════════════════════════════════════════════
+# УЧЁТ РЕЗУЛЬТАТОВ ТОРГОВЫХ СИГНАЛОВ (signals.json на Volume)
+# ═══════════════════════════════════════════════
+# Статусы: pending (ждём вход) → active (вошли) → tp / sl / timeout; либо pending → expired
+# (вход не сработал до следующего сигнала). Если в одной 5-минутной свече задеты и стоп,
+# и тейк — засчитываем СТОП (осторожно). В свече входа засчитывается только стоп.
+SIGNALS_FILE          = "signals.json"
+SIGNAL_CHECK_SECONDS  = 300
+SIGNAL_MAX_HOLD_DAYS  = 7
+SIGNAL_KEEP_DAYS      = 90
+WEEKLY_REPORT_DAY     = "sun"
+WEEKLY_REPORT_HOUR_DUBAI = 20
+signals_lock = threading.Lock()
+
+def load_signals():
+    return load_json_file(SIGNALS_FILE, {"signals": [], "next_id": 1})
+
+def save_signals(data):
+    save_json_file(SIGNALS_FILE, data)
+
+def register_signals(records, msg_id, created_at, expires_at):
+    with signals_lock:
+        data = load_signals()
+        ts = int(created_at.timestamp())
+        for rec in records:
+            rec.update({
+                "id": data.get("next_id", 1),
+                "msg_id": msg_id,
+                "created_ts": ts,
+                "expires_ts": int(expires_at.timestamp()),
+                "last_check_ts": ts,
+                "status": "pending",
+                "entry_ts": None, "close_ts": None, "close_price": None, "r": None,
+            })
+            data["next_id"] = rec["id"] + 1
+            data["signals"].append(rec)
+        cutoff = time.time() - SIGNAL_KEEP_DAYS * 86400
+        data["signals"] = [s for s in data["signals"] if s.get("created_ts", 0) >= cutoff
+                           or s.get("status") in ("pending", "active")]
+        save_signals(data)
+
+def get_klines_since(symbol, category, start_ts):
+    """5-минутные свечи начиная с start_ts (сек), от старых к новым."""
+    try:
+        url = ("https://api.bybit.com/v5/market/kline?category=" + category + "&symbol=" + symbol
+               + "&interval=5&start=" + str(int(start_ts) * 1000) + "&limit=1000")
+        r = requests.get(url, timeout=15).json()
+        rows = r.get("result", {}).get("list", [])
+        return list(reversed(rows))
+    except:
+        return []
+
+def fmt_dur(seconds):
+    h = int(seconds // 3600)
+    if h >= 24:
+        return str(h // 24) + "д " + str(h % 24) + "ч"
+    return str(max(h, 0)) + "ч " + str(int(seconds % 3600 // 60)) + "м"
+
+def notify_signal_close(s):
+    d = s["dir"]
+    if s["status"] == "tp":
+        head = "&#9989; <b>" + s["coin"] + " " + d + "</b> — тейк $" + fmt_price(s["take"])
+        tail = " · " + "{:+.1f}".format(s["r"]) + "R"
+    elif s["status"] == "sl":
+        head = "&#10060; <b>" + s["coin"] + " " + d + "</b> — стоп $" + fmt_price(s["stop"])
+        tail = " · -1.0R"
+    elif s["status"] == "timeout":
+        head = ("&#8987; <b>" + s["coin"] + " " + d + "</b> — закрыт по времени ("
+                + str(SIGNAL_MAX_HOLD_DAYS) + " дн.) по $" + fmt_price(s["close_price"]))
+        tail = " · " + "{:+.1f}".format(s["r"]) + "R"
+    else:  # expired
+        exp = datetime.fromtimestamp(s["expires_ts"], DUBAI_TZ).strftime("%H:%M")
+        text = ("&#9898; <b>" + s["coin"] + " " + d + "</b> — вход $" + fmt_price(s["entry"])
+                + " не сработал до " + exp + ", сигнал снят")
+        send_telegram_ex(text, THREAD_GENERAL, reply_to=s.get("msg_id"))
+        return
+    held = ""
+    if s.get("entry_ts") and s.get("close_ts"):
+        held = " · " + fmt_dur(s["close_ts"] - s["entry_ts"]) + " в сделке"
+    send_telegram_ex(head + tail + held, THREAD_GENERAL, reply_to=s.get("msg_id"))
+
+def check_one_signal(s):
+    """Прогоняет новые 5-минутные свечи по сигналу. Возвращает True, если статус сменился на финальный."""
+    rows = get_klines_since(s["symbol"], s["category"], s["last_check_ts"])
+    if not rows:
+        return False
+    now_ts = time.time()
+    long_ = s["dir"] == "LONG"
+    risk = abs(s["entry"] - s["stop"])
+    for row in rows:
+        bar_start = int(row[0]) // 1000
+        bar_end = bar_start + 300
+        if bar_end > now_ts:
+            break   # незакрытая свеча — проверим в следующий раз
+        if bar_start < s["last_check_ts"] - 300:
+            continue
+        high = float(row[2]); low = float(row[3]); close = float(row[4])
+        s["last_check_ts"] = bar_end
+
+        if s["status"] == "pending":
+            if bar_start >= s["expires_ts"]:
+                s["status"] = "expired"
+                s["close_ts"] = s["expires_ts"]
+                return True
+            touched = low <= s["entry"] if long_ else high >= s["entry"]
+            if touched:
+                s["status"] = "active"
+                s["entry_ts"] = bar_start
+                hit_stop = low <= s["stop"] if long_ else high >= s["stop"]
+                if hit_stop:
+                    s.update({"status": "sl", "close_ts": bar_end, "close_price": s["stop"], "r": -1.0})
+                    return True
+            continue
+
+        if s["status"] == "active":
+            hit_stop = low <= s["stop"] if long_ else high >= s["stop"]
+            hit_take = high >= s["take"] if long_ else low <= s["take"]
+            if hit_stop:
+                s.update({"status": "sl", "close_ts": bar_end, "close_price": s["stop"], "r": -1.0})
+                return True
+            if hit_take:
+                s.update({"status": "tp", "close_ts": bar_end, "close_price": s["take"],
+                          "r": round(s["rr"] or 0, 2)})
+                return True
+            if bar_end - s["entry_ts"] >= SIGNAL_MAX_HOLD_DAYS * 86400:
+                move = (close - s["entry"]) if long_ else (s["entry"] - close)
+                s.update({"status": "timeout", "close_ts": bar_end, "close_price": close,
+                          "r": round(move / risk, 2) if risk > 0 else 0.0})
+                return True
+    return False
+
+def run_signal_tracker_once(notify=True):
+    closed = []
+    with signals_lock:
+        data = load_signals()
+        for s in data["signals"]:
+            if s.get("status") not in ("pending", "active"):
+                continue
+            try:
+                if check_one_signal(s):
+                    closed.append(dict(s))
+            except:
+                pass
+            time.sleep(0.2)
+        save_signals(data)
+    if notify:
+        for s in closed:
+            try:
+                notify_signal_close(s)
+            except:
+                pass
+    return closed
+
+def signal_tracker_loop():
+    time.sleep(60)
+    while True:
+        try:
+            run_signal_tracker_once(notify=True)
+        except:
+            pass
+        time.sleep(SIGNAL_CHECK_SECONDS)
+
+def format_signal_report(days=7):
+    data = load_signals()
+    now_ts = time.time()
+    since = now_ts - days * 86400
+    sigs = [s for s in data["signals"] if s.get("created_ts", 0) >= since]
+    closed = [s for s in sigs if s.get("status") in ("tp", "sl", "timeout")]
+    expired = [s for s in sigs if s.get("status") == "expired"]
+    open_ = [s for s in sigs if s.get("status") in ("pending", "active")]
+    entered = closed + [s for s in open_ if s.get("status") == "active"]
+
+    d_from = datetime.fromtimestamp(since, DUBAI_TZ).strftime("%d.%m")
+    d_to = now_local().strftime("%d.%m")
+    lines = ["&#128202; <b>СТАТИСТИКА СИГНАЛОВ · " + d_from + "–" + d_to + "</b>"]
+    if not sigs:
+        lines.append("За период сигналов LONG/SHORT не было.")
+        return "\n".join(lines)
+
+    wins = [s for s in closed if (s.get("r") or 0) > 0]
+    total_r = sum((s.get("r") or 0) for s in closed)
+    lines.append("Сигналов: " + str(len(sigs)) + " · Вошли: " + str(len(entered))
+                 + " · Не сработали: " + str(len(expired)) + " · В работе: " + str(len(open_)))
+    if closed:
+        n_tp = len([s for s in closed if s["status"] == "tp"])
+        n_sl = len([s for s in closed if s["status"] == "sl"])
+        n_to = len([s for s in closed if s["status"] == "timeout"])
+        wr = len(wins) / len(closed) * 100
+        lines.append("Тейк: " + str(n_tp) + " · Стоп: " + str(n_sl)
+                     + (" · По времени: " + str(n_to) if n_to else "")
+                     + " · Винрейт " + "{:.0f}".format(wr) + "% · Итог " + "{:+.1f}".format(total_r) + "R")
+        lines.append("В $ при риске " + "{:g}".format(RISK_PCT) + "%: " + "{:+.2f}".format(total_r * DEPOSIT * RISK_PCT / 100)
+                     + "$ (без комиссий)")
+
+        by_coin = []
+        for coin in TRADE_SIGNAL_TICKERS:
+            cs = [s for s in closed if s["coin"] == coin]
+            if cs:
+                by_coin.append(coin + " " + "{:+.1f}".format(sum((s.get("r") or 0) for s in cs)) + "R")
+        if by_coin:
+            lines.append(" · ".join(by_coin))
+
+        dir_parts = []
+        for d in ("LONG", "SHORT"):
+            ds = [s for s in closed if s["dir"] == d]
+            if ds:
+                dw = len([s for s in ds if (s.get("r") or 0) > 0])
+                dir_parts.append(d + " " + str(dw) + "/" + str(len(ds)))
+        if dir_parts:
+            lines.append(" · ".join(dir_parts))
+
+        conf_parts = []
+        for c in (5, 4, 3, 2, 1):
+            cs = [s for s in closed if s.get("conf") == c]
+            if cs:
+                cw = len([s for s in cs if (s.get("r") or 0) > 0])
+                conf_parts.append(conf_dots(c) + " " + str(cw) + "/" + str(len(cs)))
+        if conf_parts:
+            lines.append("По уверенности: " + " · ".join(conf_parts))
+    else:
+        lines.append("Закрытых сделок пока нет.")
+    return "\n".join(lines)
+
+def weekly_signal_report():
+    try:
+        send_telegram(format_signal_report(7), THREAD_GENERAL)
+    except:
+        pass
 
 def trade_signal_loop():
     """Фоновый поток: проверяет каждую минуту, не наступил ли один из часов
@@ -2961,6 +3375,29 @@ btc_analysis_thread.start()
 # Фоновый поток торговых сигналов BTC/ETH/LINK (Claude Opus 5, 11:00 / 18:00 / 22:00 / 02:00 по Дубаю)
 trade_signal_thread = threading.Thread(target=trade_signal_loop, daemon=True)
 trade_signal_thread.start()
+
+# Учёт результатов торговых сигналов (проверка каждые 5 минут) + недельный отчёт
+signal_tracker_thread = threading.Thread(target=signal_tracker_loop, daemon=True)
+signal_tracker_thread.start()
+scheduler.add_job(weekly_signal_report, "cron", day_of_week=WEEKLY_REPORT_DAY,
+                  hour=dubai_to_utc_hour(WEEKLY_REPORT_HOUR_DUBAI), minute=0)
+
+@app.route("/test_signal_tracker")
+def test_signal_tracker():
+    """Разовая проверка учёта сигналов (без уведомлений в Telegram) + список сигналов."""
+    closed = run_signal_tracker_once(notify=False)
+    data = load_signals()
+    return json.dumps({"closed_now": closed, "signals": data.get("signals", [])[-30:]},
+                      indent=2, ensure_ascii=False, default=str), 200, {"Content-Type": "application/json; charset=utf-8"}
+
+@app.route("/test_signal_report")
+def test_signal_report():
+    """Превью недельного отчёта. ?send=1 — отправить в General, ?days=30 — другой период."""
+    days = int(request.args.get("days", "7") or 7)
+    text = format_signal_report(days)
+    if request.args.get("send") == "1":
+        send_telegram(text, THREAD_GENERAL)
+    return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 @app.route("/test_storage")
 def test_storage():
