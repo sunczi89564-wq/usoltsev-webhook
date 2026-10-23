@@ -2,13 +2,64 @@ from flask import Flask, request
 import requests
 import os
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import xml.etree.ElementTree as ET
 import threading
 import time
 
 app = Flask(__name__)
+
+# ═══════════════════════════════════════════════
+# ВРЕМЯ: сервер Railway живёт в UTC. Всё расписание и подписи в сообщениях —
+# по времени Дубая (UTC+4, без перехода на летнее время → фиксированное смещение).
+# ═══════════════════════════════════════════════
+DUBAI_TZ = timezone(timedelta(hours=4))
+DUBAI_LABEL = "(Дубай)"
+
+def now_local():
+    """Текущее время по Дубаю (для расписания и подписей в сообщениях)."""
+    return datetime.now(DUBAI_TZ)
+
+def dubai_to_utc_hour(h):
+    """Час по Дубаю -> час по UTC (для cron-задач APScheduler, который работает в UTC)."""
+    return (h - 4) % 24
+
+# ═══════════════════════════════════════════════
+# ПОСТОЯННОЕ ХРАНИЛИЩЕ (Railway Volume)
+# ═══════════════════════════════════════════════
+# Если к сервису подключён Volume, Railway сам передаёт путь в RAILWAY_VOLUME_MOUNT_PATH
+# (у нас /data) — файлы там переживают редеплой. Без Volume пишем в рабочую папку, как раньше.
+DATA_DIR = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") or "."
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except:
+    pass
+
+def data_path(name):
+    return os.path.join(DATA_DIR, name)
+
+def load_json_file(name, default):
+    path = data_path(name)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return default
+
+def save_json_file(name, data):
+    """Атомарная запись: сначала во временный файл, потом замена — чтобы при
+    перезапуске посреди записи файл не оказался битым."""
+    path = data_path(name)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except:
+        pass
 
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -52,7 +103,7 @@ BUFFER_SECONDS = 60
 # ═══════════════════════════════════════════════
 # ИСТОРИЯ СДЕЛОК И СТАТИСТИКА
 # ═══════════════════════════════════════════════
-TRADES_FILE = "trades.json"
+TRADES_FILE = data_path("trades.json")
 DEPOSIT     = 100.0
 LEVERAGE    = 50
 BYBIT_FEE_PCT = 0.055   # средняя комиссия тейкера Bybit за одну сторону сделки, %
@@ -232,11 +283,7 @@ def load_trades_data():
     return {"start_date": None, "open_positions": {}, "closed_trades": []}
 
 def save_trades_data(data):
-    try:
-        with open(TRADES_FILE, "w") as f:
-            json.dump(data, f)
-    except:
-        pass
+    save_json_file("trades.json", data)
 
 def f_price(p):
     try:
@@ -593,7 +640,7 @@ def get_traditional_prices():
         "BZ=F":      "brent",
         "DX-Y.NYB":  "dxy",
         "USDRUB=X":  "usdrub",
-        "AEDUSД=X":  "aedusd",
+        "AED=X":     "aedusd",   # USD→AED (~3.6725). Было "AEDUSД=X" с кириллической Д — не работало
         "ES=F":      "es",
     }
     for symbol, key in pairs.items():
@@ -830,11 +877,11 @@ def daily_report():
     total3_val    = total3.get("value", 0) or 0
     total3_change = total3.get("change", 0) or 0
 
-    now = datetime.now()
+    now = now_local()
     hour = now.hour
-    if hour == 4:
+    if hour < 12:
         greeting = "&#9728; <b>УТРЕННИЙ ДАЙДЖЕСТ</b>"
-    elif hour == 10:
+    elif hour < 17:
         greeting = "&#127774; <b>ДНЕВНОЙ ДАЙДЖЕСТ</b>"
     else:
         greeting = "&#127762; <b>ВЕЧЕРНИЙ ДАЙДЖЕСТ</b>"
@@ -842,7 +889,7 @@ def daily_report():
     line = "------------------------------"
     text = (
         greeting + "\n"
-        + now.strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
+        + now.strftime("%d.%m.%Y  %H:%M") + " " + DUBAI_LABEL + "\n"
         + line + "\n"
         + "&#129377; <b>КРИПТО</b>\n"
         + "BTC: $" + "{:,.0f}".format(btc_price) + " (" + "{:+.2f}".format(btc_change) + "%)\n"
@@ -1351,10 +1398,11 @@ def flush_whale_alerts():
     )
     send_telegram(text, THREAD_WHALE)
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(daily_report, "cron", hour=4,  minute=0)
-scheduler.add_job(daily_report, "cron", hour=10, minute=0)
-scheduler.add_job(daily_report, "cron", hour=14, minute=0)
+# Дайджест: 08:00 / 14:00 / 18:00 по Дубаю. Планировщик явно в UTC, часы переводим.
+DIGEST_HOURS_DUBAI = [8, 14, 18]
+scheduler = BackgroundScheduler(timezone="UTC")
+for _h in DIGEST_HOURS_DUBAI:
+    scheduler.add_job(daily_report, "cron", hour=dubai_to_utc_hour(_h), minute=0)
 scheduler.add_job(flush_whale_alerts, "interval", hours=4)
 scheduler.start()
 
@@ -1625,7 +1673,9 @@ VOL_AVG_BARS      = 20     # сколько предыдущих закрыты�
 VOL_POLL_SECONDS  = 7200   # было 900 (15 минут) — теперь раз в 2 часа, для общего обзора
 
 # coin -> "armed" (может сработать) | "cooldown" (ждём остывания ниже VOL_RESET_RATIO)
-volume_alert_state = {}
+# Сохраняется на Volume — гистерезис больше не сбрасывается при редеплое.
+VOLUME_STATE_FILE = "volume_alert_state.json"
+volume_alert_state = load_json_file(VOLUME_STATE_FILE, {})
 
 def get_hourly_klines(symbol, limit=21):
     """limit по умолчанию не используется явно — вызывающий код передаёт VOL_AVG_BARS+2:
@@ -1691,6 +1741,8 @@ def volume_alert_loop():
                 elif state == "cooldown" and ratio < VOL_RESET_RATIO:
                     volume_alert_state[coin] = "armed"
 
+            save_json_file(VOLUME_STATE_FILE, volume_alert_state)
+
             if hits:
                 hits.sort(key=lambda h: h[1], reverse=True)
                 lines = []
@@ -1724,7 +1776,7 @@ def volume_alert_loop():
 # сценарии с вероятностями, риски, триггеры, резюме дня — по образцу, который
 # прислал пользователь (скриншот канала "Лев и Киса").
 CLAUDE_MODEL   = "claude-opus-5"
-BTC_ANALYSIS_INTERVAL_HOURS = 8
+BTC_ANALYSIS_HOURS_DUBAI = [6, 14, 22]   # время BTC-анализа по Дубаю
 
 def get_btc_klines(interval, limit):
     """Свечи BTCUSDT с Bybit. interval: '240' = 4ч, 'D' = дневные.
@@ -2036,7 +2088,7 @@ def run_btc_analysis(send=True):
     line = "------------------------------"
     full_text = (
         "&#8383; <b>АНАЛИЗ BTC</b>\n"
-        + datetime.now().strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
+        + now_local().strftime("%d.%m.%Y  %H:%M") + " " + DUBAI_LABEL + "\n"
         + line + "\n"
         + text + "\n"
         + line + "\n"
@@ -2049,15 +2101,21 @@ def run_btc_analysis(send=True):
     return full_text, None
 
 def btc_analysis_loop():
-    """Фоновый поток: раз в BTC_ANALYSIS_INTERVAL_HOURS часов запускает полный анализ
-    и шлёт в тему General. Ошибки логируются в per-iteration try/except, чтобы одна
-    неудачная попытка не убила поток навсегда."""
+    """Фоновый поток: раз в минуту проверяет, не наступил ли один из часов
+    BTC_ANALYSIS_HOURS_DUBAI (по Дубаю) — и запускает анализ один раз в этот час.
+    Больше не стреляет при каждом редеплое и не сдвигается от времени деплоя."""
+    last_sent_key = None
     while True:
         try:
-            run_btc_analysis(send=True)
+            now = now_local()
+            if now.hour in BTC_ANALYSIS_HOURS_DUBAI and now.minute == 0:
+                key = now.strftime("%Y-%m-%d-%H")
+                if key != last_sent_key:
+                    run_btc_analysis(send=True)
+                    last_sent_key = key
         except:
             pass
-        time.sleep(BTC_ANALYSIS_INTERVAL_HOURS * 3600)
+        time.sleep(30)
 
 # ═══════════════════════════════════════════════
 # ТОРГОВЫЙ СИГНАЛ (Claude Opus 5, 4 раза в день, тема General)
@@ -2072,8 +2130,9 @@ def btc_analysis_loop():
 # Использует те же универсальные функции метрик/свечей, что и Ask Analysis
 # (build_universal_metrics, get_klines_universal, resolve_symbol_and_category),
 # чтобы не дублировать BTC-специфичную логику под каждый новый тикер.
-TRADE_SIGNAL_HOURS_UTC5 = [7, 14, 18, 22]   # время отправки, UTC+5 (соответствует
-                                              # 5:00 / 12:00 / 16:00 / 20:00 МСК)
+# Время по Дубаю. Это ровно те часы, в которые сигналы фактически приходили раньше
+# (код считал 7/14/18/22 "UTC+5", но сервер в UTC → по Дубаю было 11/18/22/02).
+TRADE_SIGNAL_HOURS_DUBAI = [11, 18, 22, 2]
 TRADE_SIGNAL_TICKERS = ["BTC", "ETH", "LINK"]
 
 def calc_atr(rows, period=14):
@@ -2324,7 +2383,7 @@ def run_trade_signal(send=True):
     separator = "\n" + line + "\n"
     full_text = (
         "&#127919; <b>ТОРГОВЫЙ СИГНАЛ</b>\n"
-        + datetime.now().strftime("%d.%m.%Y  %H:%M") + " (UTC+5)\n"
+        + now_local().strftime("%d.%m.%Y  %H:%M") + " " + DUBAI_LABEL + "\n"
         + line + "\n"
         + separator.join(blocks) + "\n"
         + line + "\n"
@@ -2338,21 +2397,21 @@ def run_trade_signal(send=True):
 
 def trade_signal_loop():
     """Фоновый поток: проверяет каждую минуту, не наступил ли один из часов
-    TRADE_SIGNAL_HOURS_UTC5 (7:00 / 14:00 / 18:00 / 22:00, UTC+5) — и если да,
+    TRADE_SIGNAL_HOURS_DUBAI (11:00 / 18:00 / 22:00 / 02:00 по Дубаю) — и если да,
     запускает мультитикерный сигнал один раз за эту минуту (защита от повторной
     отправки внутри той же минуты через флаг)."""
     last_sent_key = None
     while True:
         try:
-            now = datetime.now()
-            if now.hour in TRADE_SIGNAL_HOURS_UTC5 and now.minute == 0:
+            now = now_local()
+            if now.hour in TRADE_SIGNAL_HOURS_DUBAI and now.minute == 0:
                 key = now.strftime("%Y-%m-%d-%H")
                 if key != last_sent_key:
                     run_trade_signal(send=True)
                     last_sent_key = key
         except:
             pass
-        time.sleep(60)
+        time.sleep(30)
 
 # ═══════════════════════════════════════════════
 # ASK ANALYSIS — анализ любого тикера по запросу (Claude Sonnet 5)
@@ -2895,13 +2954,39 @@ onchain_thread.start()
 volume_thread = threading.Thread(target=volume_alert_loop, daemon=True)
 volume_thread.start()
 
-# Фоновый поток анализа BTC (Claude Opus 5, раз в 8 часов)
+# Фоновый поток анализа BTC (Claude Opus 5, 06:00 / 14:00 / 22:00 по Дубаю)
 btc_analysis_thread = threading.Thread(target=btc_analysis_loop, daemon=True)
 btc_analysis_thread.start()
 
-# Фоновый поток торговых сигналов BTC (Claude Opus 5, дважды в день: 6:00 и 18:00 UTC+5)
+# Фоновый поток торговых сигналов BTC/ETH/LINK (Claude Opus 5, 11:00 / 18:00 / 22:00 / 02:00 по Дубаю)
 trade_signal_thread = threading.Thread(target=trade_signal_loop, daemon=True)
 trade_signal_thread.start()
+
+@app.route("/test_storage")
+def test_storage():
+    """Проверка Volume: куда пишутся данные и что там лежит."""
+    report = {
+        "data_dir": DATA_DIR,
+        "volume_mounted": bool(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")),
+        "now_dubai": now_local().strftime("%d.%m.%Y %H:%M"),
+        "files": {},
+    }
+    try:
+        for name in os.listdir(DATA_DIR):
+            p = os.path.join(DATA_DIR, name)
+            if os.path.isfile(p) and name.endswith(".json"):
+                report["files"][name] = os.path.getsize(p)
+    except Exception as e:
+        report["error"] = str(e)
+    try:
+        test_name = "_write_test.json"
+        save_json_file(test_name, {"ok": True})
+        report["write_ok"] = load_json_file(test_name, {}).get("ok", False)
+        os.remove(data_path(test_name))
+    except Exception as e:
+        report["write_ok"] = False
+        report["write_error"] = str(e)
+    return json.dumps(report, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
