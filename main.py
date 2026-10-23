@@ -1305,6 +1305,12 @@ def telegram_updates():
         send_telegram(format_stats("НЕДЕЛЯ", 24 * 7, tf_filter), thread_id)
     elif text.startswith("/statsmonth"):
         send_telegram(format_stats("МЕСЯЦ", 24 * 30, tf_filter), thread_id)
+    elif text.startswith("/whalestats"):
+        parts = text.split()
+        days = 30
+        if len(parts) > 1 and parts[1].isdigit():
+            days = max(1, min(int(parts[1]), 90))
+        send_telegram(format_whale_journal_report(days), thread_id)
     elif text.startswith("/signalstats"):
         # /signalstats — за 7 дней, /signalstats 30 — за 30 дней
         parts = text.split()
@@ -1344,10 +1350,13 @@ def flush_whale_alerts():
     Без привязки к конкретной бирже — данные идут из сети Ethereum по контракту токена,
     не по конкретному известному адресу."""
     with whale_alert_lock:
-        if not whale_alert_buffer:
-            return
         entries = whale_alert_buffer.copy()
         whale_alert_buffer.clear()
+
+    # Журнал китов: замер по всем монетам за окно (в фоне — там запросы цен)
+    threading.Thread(target=whale_journal_record, args=(entries,), daemon=True).start()
+    if not entries:
+        return
 
     # coin -> {"buy": [value,...], "sell": [...], "transfer": [...], "chain": "ETH"}
     grouped = {}
@@ -3637,6 +3646,178 @@ def test_us_premarket():
     return ("Открытие NYSE сегодня: " + open_dt.strftime("%d.%m %H:%M") + " (Дубай), торговый день: "
             + str(is_trading) + "\n\n" + text), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
+# ═══════════════════════════════════════════════
+# ЖУРНАЛ КИТОВ: предсказывает ли китовый поток движение цены?
+# ═══════════════════════════════════════════════
+# Каждую 4-часовую сводку пишем по ВСЕМ монетам WHALE_COINS (включая нулевой поток — это
+# контрольная группа): net, покупки/продажи, цена. Потом дописываем цену через 4/12/24 часа.
+# Отчёт /whalestats группирует замеры по силе потока и показывает, как часто цена шла
+# в сторону потока и средний ход.
+WHALE_JOURNAL_FILE      = "whale_journal.json"
+WHALE_JOURNAL_KEEP_DAYS = 90
+WHALE_HORIZONS_H        = [4, 12, 24]
+WHALE_JOURNAL_CHECK_SEC = 600
+WHALE_WEEKLY_HOUR_DUBAI = 20
+WHALE_WEEKLY_MINUTE     = 5
+whale_journal_lock = threading.Lock()
+
+def whale_coin_symbol(coin):
+    sym = whale_symbol_cache.get(coin)
+    return sym or (coin + "USDT")
+
+def get_all_linear_prices():
+    """Один запрос — цены всех перпетуалов Bybit: {symbol: lastPrice}."""
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear", timeout=15).json()
+        return {x["symbol"]: float(x["lastPrice"]) for x in r.get("result", {}).get("list", [])
+                if x.get("lastPrice")}
+    except:
+        return {}
+
+def get_price_at(symbol, ts):
+    """Цена закрытия 5-минутной свечи, в которую попадает момент ts (сек)."""
+    try:
+        start = int(ts // 300 * 300) * 1000
+        r = requests.get("https://api.bybit.com/v5/market/kline?category=linear&symbol=" + symbol
+                         + "&interval=5&start=" + str(start) + "&limit=1", timeout=10).json()
+        lst = r.get("result", {}).get("list", [])
+        if lst:
+            return float(lst[0][4])
+    except:
+        pass
+    return None
+
+def whale_journal_record(entries):
+    """Записывает замер по всем монетам за прошедшее 4-часовое окно."""
+    try:
+        prices = get_all_linear_prices()
+        agg = {}
+        for e in entries:
+            cat = e.get("category")
+            if cat not in ("buy", "sell"):
+                continue
+            a = agg.setdefault(e.get("coin", "?"), {"buy": 0.0, "sell": 0.0, "nb": 0, "ns": 0})
+            v = float(e.get("value", 0) or 0)
+            if cat == "buy":
+                a["buy"] += v; a["nb"] += 1
+            else:
+                a["sell"] += v; a["ns"] += 1
+        ts = int(time.time())
+        rows = []
+        for coin in WHALE_COINS:
+            sym = whale_coin_symbol(coin)
+            p0 = prices.get(sym)
+            if not p0:
+                continue
+            a = agg.get(coin, {"buy": 0.0, "sell": 0.0, "nb": 0, "ns": 0})
+            rows.append({"ts": ts, "coin": coin, "sym": sym, "net": round(a["buy"] - a["sell"]),
+                         "buy": round(a["buy"]), "sell": round(a["sell"]), "nb": a["nb"], "ns": a["ns"],
+                         "p0": p0, "p4": None, "p12": None, "p24": None})
+        with whale_journal_lock:
+            data = load_json_file(WHALE_JOURNAL_FILE, {"rows": []})
+            data["rows"].extend(rows)
+            cutoff = ts - WHALE_JOURNAL_KEEP_DAYS * 86400
+            data["rows"] = [r for r in data["rows"] if r["ts"] >= cutoff]
+            save_json_file(WHALE_JOURNAL_FILE, data)
+    except:
+        pass
+
+def whale_journal_fill_once(max_fetch=300):
+    """Дописывает цены через 4/12/24ч для созревших замеров."""
+    now = time.time()
+    fetched = 0
+    with whale_journal_lock:
+        data = load_json_file(WHALE_JOURNAL_FILE, {"rows": []})
+        changed = False
+        for r in data["rows"]:
+            for h in WHALE_HORIZONS_H:
+                key = "p" + str(h)
+                if r.get(key) is None and now >= r["ts"] + h * 3600 + 300:
+                    if fetched >= max_fetch:
+                        break
+                    p = get_price_at(r["sym"], r["ts"] + h * 3600)
+                    fetched += 1
+                    if p:
+                        r[key] = p
+                        changed = True
+                    time.sleep(0.05)
+        if changed:
+            save_json_file(WHALE_JOURNAL_FILE, data)
+    return fetched
+
+def whale_journal_loop():
+    time.sleep(120)
+    while True:
+        try:
+            whale_journal_fill_once()
+        except:
+            pass
+        time.sleep(WHALE_JOURNAL_CHECK_SEC)
+
+WHALE_BUCKETS = [
+    (">+$500k",     lambda n: n >= 500000,             1),
+    ("+$100–500k",  lambda n: 100000 <= n < 500000,    1),
+    ("слабо/нет",   lambda n: -100000 < n < 100000,    0),
+    ("−$100–500k",  lambda n: -500000 < n <= -100000, -1),
+    ("<−$500k",     lambda n: n <= -500000,           -1),
+]
+
+def _whale_bucket_stats(rows):
+    """Строки таблицы для набора замеров."""
+    out = []
+    for label, cond, sign in WHALE_BUCKETS:
+        rs = [r for r in rows if cond(r["net"])]
+        cells = []
+        for h in WHALE_HORIZONS_H:
+            key = "p" + str(h)
+            moves = [(r[key] - r["p0"]) / r["p0"] * 100 for r in rs if r.get(key) and r["p0"]]
+            if not moves:
+                cells.append("     —     ")
+                continue
+            if sign >= 0:
+                hit = sum(1 for m in moves if m > 0) / len(moves) * 100
+                arrow = "↑"
+            else:
+                hit = sum(1 for m in moves if m < 0) / len(moves) * 100
+                arrow = "↓"
+            avg = sum(moves) / len(moves)
+            cells.append(arrow + "{:>3.0f}% {:>+5.1f}%".format(hit, avg))
+        out.append("{:<11} {:>5}  ".format(label, len(rs)) + "  ".join(cells))
+    return out
+
+def format_whale_journal_report(days=30):
+    since = time.time() - days * 86400
+    with whale_journal_lock:
+        rows = [r for r in load_json_file(WHALE_JOURNAL_FILE, {"rows": []})["rows"] if r["ts"] >= since]
+    head = "&#128011; <b>КИТЫ → ЦЕНА · " + str(days) + " дн. · " + str(len(rows)) + " замеров</b>"
+    if not rows:
+        return head + "\nДанных пока нет — журнал копится каждые 4 часа."
+    hdr = "{:<11} {:>5}  ".format("Net-поток", "N") + "  ".join("{:^11}".format("через " + str(h) + "ч") for h in WHALE_HORIZONS_H)
+    body = [hdr] + _whale_bucket_stats(rows)
+    for coin in ("BTC", "ETH"):
+        cr = [r for r in rows if r["coin"] == coin]
+        if cr:
+            body += ["", coin + ":"] + _whale_bucket_stats(cr)
+    first = datetime.fromtimestamp(min(r["ts"] for r in rows), DUBAI_TZ).strftime("%d.%m")
+    return (head + "\nс " + first + " · ↑/↓ — как часто цена шла в сторону потока, рядом средний ход цены\n"
+            + "<pre>" + html_escape("\n".join(body)) + "</pre>\n"
+            + "<i>Связь есть, если у крупных потоков заметно больше 50% и лучше строки «слабо/нет».</i>")
+
+def weekly_whale_report():
+    try:
+        send_telegram(format_whale_journal_report(30), THREAD_WHALE)
+    except:
+        pass
+
+@app.route("/test_whale_journal")
+def test_whale_journal():
+    """Журнал китов: число замеров и превью отчёта. ?fill=1 — дописать созревшие цены сейчас."""
+    filled = whale_journal_fill_once() if request.args.get("fill") == "1" else 0
+    days = int(request.args.get("days", "30") or 30)
+    data = load_json_file(WHALE_JOURNAL_FILE, {"rows": []})
+    return ("Замеров всего: " + str(len(data["rows"])) + " · запрошено цен сейчас: " + str(filled)
+            + "\n\n" + format_whale_journal_report(days)), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
 @app.route("/test_signal_tracker")
 def test_signal_tracker():
     """Разовая проверка учёта сигналов (без уведомлений в Telegram) + список сигналов."""
@@ -3683,6 +3864,12 @@ def test_storage():
 # Брифинг перед открытием биржи США (за 30 мин до 9:30 Нью-Йорка, только торговые дни)
 us_premarket_thread = threading.Thread(target=us_premarket_loop, daemon=True)
 us_premarket_thread.start()
+
+# Журнал китов: дописывание цен через 4/12/24ч + еженедельный отчёт в Whale Alerts
+whale_journal_thread = threading.Thread(target=whale_journal_loop, daemon=True)
+whale_journal_thread.start()
+scheduler.add_job(weekly_whale_report, "cron", day_of_week="sun",
+                  hour=dubai_to_utc_hour(WHALE_WEEKLY_HOUR_DUBAI), minute=WHALE_WEEKLY_MINUTE)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
