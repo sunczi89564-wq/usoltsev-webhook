@@ -1797,7 +1797,7 @@ def volume_alert_loop():
 # собственные данные (китовая активность, объёмный сканер) и пишет ТОЛЬКО текст:
 # сценарии с вероятностями, риски, триггеры, резюме дня — по образцу, который
 # прислал пользователь (скриншот канала "Лев и Киса").
-CLAUDE_MODEL   = "claude-opus-5"
+CLAUDE_MODEL   = "claude-opus-5-5"
 BTC_ANALYSIS_HOURS_DUBAI = [6, 14, 22]   # время BTC-анализа по Дубаю
 
 def get_btc_klines(interval, limit):
@@ -2472,7 +2472,7 @@ def run_single_ticker_signal(coin, expires_at=None):
 
     system_prompt, user_prompt = build_trade_signal_prompt(coin, metrics, levels, rows_4h_tail, news,
                                                            whale_summary, volume_summary, crowd)
-    raw_text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=600)
+    raw_text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=1200)
     if error:
         return None, error, None
 
@@ -3379,8 +3379,267 @@ trade_signal_thread.start()
 # Учёт результатов торговых сигналов (проверка каждые 5 минут) + недельный отчёт
 signal_tracker_thread = threading.Thread(target=signal_tracker_loop, daemon=True)
 signal_tracker_thread.start()
+
+# Брифинг перед открытием биржи США (за 30 мин до 9:30 Нью-Йорка, только торговые дни)
+us_premarket_thread = threading.Thread(target=us_premarket_loop, daemon=True)
+us_premarket_thread.start()
 scheduler.add_job(weekly_signal_report, "cron", day_of_week=WEEKLY_REPORT_DAY,
                   hour=dubai_to_utc_hour(WEEKLY_REPORT_HOUR_DUBAI), minute=0)
+
+# ═══════════════════════════════════════════════
+# АНАЛИЗ ПЕРЕД ОТКРЫТИЕМ БИРЖИ США (Claude Opus, тема General)
+# ═══════════════════════════════════════════════
+# NYSE открывается в 9:30 по Нью-Йорку. Летнее время в США считаем сами (без внешних
+# библиотек часовых поясов): с 2-го воскресенья марта по 1-е воскресенье ноября — UTC-4,
+# иначе UTC-5. Только будни, праздники NYSE пропускаем.
+US_PREMARKET_LEAD_MIN = 30          # за сколько минут до открытия отправлять
+US_PREMARKET_MODEL    = None   # берётся CLAUDE_MODEL (Opus) — см. run_us_premarket
+NYSE_HOLIDAYS = {
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
+    "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    # 2027
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+}
+
+def _nth_sunday(year, month, n):
+    d = datetime(year, month, 1)
+    first_sun = 1 + (6 - d.weekday()) % 7
+    return first_sun + 7 * (n - 1)
+
+def ny_utc_offset_hours(dt_utc):
+    """-4 летом (EDT), -5 зимой (EST). Переход в 2:00 по местному времени."""
+    y = dt_utc.year
+    start = datetime(y, 3, _nth_sunday(y, 3, 2), 7, tzinfo=timezone.utc)    # 2:00 EST = 7:00 UTC
+    end = datetime(y, 11, _nth_sunday(y, 11, 1), 6, tzinfo=timezone.utc)   # 2:00 EDT = 6:00 UTC
+    return -4 if start <= dt_utc < end else -5
+
+def next_us_open_info(now_utc=None):
+    """Возвращает (open_dt_dubai, is_trading_day) для сегодняшней даты Нью-Йорка."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    off = ny_utc_offset_hours(now_utc)
+    ny_now = now_utc + timedelta(hours=off)
+    open_utc = datetime(ny_now.year, ny_now.month, ny_now.day, 9, 30, tzinfo=timezone.utc) - timedelta(hours=off)
+    is_trading = ny_now.weekday() < 5 and ny_now.strftime("%Y-%m-%d") not in NYSE_HOLIDAYS
+    return open_utc.astimezone(DUBAI_TZ), is_trading
+
+def yahoo_quote(symbol):
+    """Последняя цена и изменение к предыдущему закрытию (%) по Yahoo. (price, change) или (None, None)."""
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=5d"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get(url, headers=headers, timeout=8).json()
+        res = r["chart"]["result"][0]
+        meta = res.get("meta", {})
+        price = meta.get("regularMarketPrice")
+        closes = [x for x in res["indicators"]["quote"][0]["close"] if x is not None]
+        if price is None and closes:
+            price = closes[-1]
+        prev = closes[-2] if len(closes) >= 2 else None
+        if price is None:
+            return None, None
+        change = (price - prev) / prev * 100 if prev else None
+        return float(price), change
+    except:
+        return None, None
+
+US_MACRO_SYMBOLS = [
+    ("ES=F",      "S&P 500 (ES)",   "fut"),
+    ("NQ=F",      "Nasdaq (NQ)",    "fut"),
+    ("YM=F",      "Dow (YM)",       "fut"),
+    ("^VIX",      "VIX",            "risk"),
+    ("DX-Y.NYB",  "DXY",            "risk"),
+    ("^TNX",      "US10Y, %",       "risk"),
+    ("CL=F",      "Нефть WTI",      "risk"),
+    ("GC=F",      "Золото",         "risk"),
+]
+
+def bybit_ticker(symbol, category):
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=" + category + "&symbol=" + symbol,
+                         timeout=8).json()
+        lst = r.get("result", {}).get("list", [])
+        if lst:
+            return float(lst[0]["lastPrice"]), float(lst[0].get("price24hPcnt") or 0) * 100
+    except:
+        pass
+    return None, None
+
+def get_us_calendar_today():
+    """Макро-события США на сегодня (High/Medium) из бесплатного календаря ForexFactory.
+    Возвращает список строк 'HH:MM (Дубай) · событие · прогноз/пред.' или None, если недоступно."""
+    try:
+        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        events = r.json()
+    except:
+        return None
+    today = now_local().date()
+    out = []
+    for e in events:
+        try:
+            if e.get("country") != "USD" or e.get("impact") not in ("High", "Medium"):
+                continue
+            dt = datetime.fromisoformat(e["date"]).astimezone(DUBAI_TZ)
+            if dt.date() != today:
+                continue
+            mark = "&#128308;" if e.get("impact") == "High" else "&#128992;"
+            extra = []
+            if e.get("forecast"):
+                extra.append("прогноз " + str(e["forecast"]))
+            if e.get("previous"):
+                extra.append("пред. " + str(e["previous"]))
+            out.append((dt, mark + " " + dt.strftime("%H:%M") + " · " + html_escape(str(e.get("title", "")))
+                        + (" (" + ", ".join(extra) + ")" if extra else "")))
+        except:
+            continue
+    out.sort(key=lambda x: x[0])
+    return [x[1] for x in out]
+
+def get_us_market_headlines(limit=6):
+    sources = [
+        "https://www.cnbc.com/id/20910258/device/rss/rss.html",
+        "https://finance.yahoo.com/news/rssindex",
+    ]
+    headlines = []
+    for url in sources:
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
+            root = ET.fromstring(r.content)
+            for item in root.findall(".//item")[:4]:
+                t = item.find("title")
+                if t is not None and t.text:
+                    headlines.append(t.text.strip()[:140])
+                if len(headlines) >= limit:
+                    return headlines
+        except:
+            continue
+    return headlines
+
+def html_escape(text):
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def fmt_chg(ch):
+    return "н/д" if ch is None else "{:+.2f}".format(ch) + "%"
+
+def run_us_premarket(send=True):
+    now = now_local()
+    open_dt, _ = next_us_open_info()
+    line = "------------------------------"
+    data_lines = []   # для промпта
+
+    fut_block, risk_block = [], []
+    for sym, label, kind in US_MACRO_SYMBOLS:
+        price, ch = yahoo_quote(sym)
+        if price is None:
+            continue
+        txt = label + ": " + fmt_price(price) + " (" + fmt_chg(ch) + ")"
+        (fut_block if kind == "fut" else risk_block).append(txt)
+        data_lines.append(txt)
+
+    crypto_block = []
+    for coin in ("BTC", "ETH"):
+        p, ch = bybit_ticker(coin + "USDT", "linear")
+        if p is not None:
+            txt = coin + ": $" + fmt_price(p) + " (" + fmt_chg(ch) + " за 24ч)"
+            crypto_block.append(txt)
+            data_lines.append(txt)
+
+    xs = []
+    for t in sorted(XSTOCKS_TICKERS - {"GOOG"}):
+        p, ch = bybit_ticker(t + "XUSDT", "spot")
+        if p is not None:
+            xs.append((t, p, ch))
+        time.sleep(0.1)
+    xs.sort(key=lambda x: abs(x[2] or 0), reverse=True)
+    xs_lines = [t + " $" + fmt_price(p) + " (" + fmt_chg(ch) + ")" for t, p, ch in xs]
+    if xs_lines:
+        data_lines.append("xStocks на Bybit (24ч): " + "; ".join(xs_lines))
+
+    calendar = get_us_calendar_today()
+    if calendar:
+        data_lines.append("События США сегодня: " + "; ".join(c.split(" ", 1)[1] for c in calendar))
+    elif calendar is not None:
+        data_lines.append("События США сегодня: значимых нет")
+
+    news = get_us_market_headlines()
+    if news:
+        data_lines.append("Новости рынка США: " + " | ".join(news))
+
+    system_prompt = (
+        "Ты — аналитик, который пишет короткий брифинг перед открытием американской биржи "
+        "для приватного Telegram-канала крипто-трейдера. Отвечай по-русски, простым текстом "
+        "без HTML и markdown. Формат строго:\n"
+        "Строка 1: НАСТРОЙ: RISK-ON, RISK-OFF или НЕЙТРАЛЬНО\n"
+        "Далее 3-5 коротких предложений: что задаёт тон (фьючерсы, VIX, доллар, доходности, события дня, "
+        "новости), главные риски сессии и чего ждать от BTC/ETH на открытии США. "
+        "Опирайся только на данные ниже, не выдумывай цифры."
+    )
+    raw, err = call_claude_opus(system_prompt, "\n".join(data_lines), max_tokens=1200)
+    mood_line, summary = "", ""
+    if raw:
+        ls = [l.strip() for l in raw.strip().split("\n") if l.strip()]
+        if ls and ls[0].upper().startswith("НАСТРОЙ"):
+            mood = ls[0].split(":", 1)[1].strip().upper() if ":" in ls[0] else ""
+            emoji = "&#128994;" if "ON" in mood else ("&#128308;" if "OFF" in mood else "&#9898;")
+            mood_line = emoji + " <b>" + html_escape(mood) + "</b>"
+            ls = ls[1:]
+        summary = html_escape(" ".join(ls))
+    else:
+        summary = "&#9888; Анализ недоступен: " + html_escape(err or "")
+
+    parts = [
+        "&#127482;&#127480; <b>ПЕРЕД ОТКРЫТИЕМ США</b>",
+        now.strftime("%d.%m.%Y  %H:%M") + " " + DUBAI_LABEL + " · открытие NYSE в " + open_dt.strftime("%H:%M"),
+        line,
+    ]
+    if fut_block:
+        parts += ["&#128200; <b>ФЬЮЧЕРСЫ</b>"] + fut_block + [line]
+    if risk_block:
+        parts += ["&#127777; <b>ФОН РИСКА</b>"] + risk_block + [line]
+    if crypto_block:
+        parts += ["&#129377; <b>КРИПТА</b>"] + crypto_block + [line]
+    if xs_lines:
+        parts += ["&#127970; <b>xSTOCKS (Bybit, 24ч)</b>"] + xs_lines + [line]
+    parts += ["&#128197; <b>СОБЫТИЯ ДНЯ (США)</b>"]
+    if calendar is None:
+        parts += ["календарь недоступен"]
+    elif calendar:
+        parts += calendar
+    else:
+        parts += ["значимых событий нет"]
+    parts += [line, "&#129504; <b>ВЫВОД</b>" + ((" · " + mood_line) if mood_line else ""), summary, line,
+              "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"]
+    text = "\n".join(parts)
+    if send:
+        send_telegram(text, THREAD_GENERAL)
+    return text
+
+def us_premarket_loop():
+    last_key = None
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            open_dubai, is_trading = next_us_open_info(now_utc)
+            send_at = open_dubai - timedelta(minutes=US_PREMARKET_LEAD_MIN)
+            now_d = now_utc.astimezone(DUBAI_TZ)
+            if is_trading and send_at <= now_d < send_at + timedelta(minutes=2):
+                key = send_at.strftime("%Y-%m-%d")
+                if key != last_key:
+                    last_key = key
+                    run_us_premarket(send=True)
+        except:
+            pass
+        time.sleep(30)
+
+@app.route("/test_us_premarket")
+def test_us_premarket():
+    """Превью брифинга перед открытием США. ?send=1 — отправить в General."""
+    text = run_us_premarket(send=(request.args.get("send") == "1"))
+    open_dt, is_trading = next_us_open_info()
+    return ("Открытие NYSE сегодня: " + open_dt.strftime("%d.%m %H:%M") + " (Дубай), торговый день: "
+            + str(is_trading) + "\n\n" + text), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 @app.route("/test_signal_tracker")
 def test_signal_tracker():
