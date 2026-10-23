@@ -3379,10 +3379,6 @@ trade_signal_thread.start()
 # Учёт результатов торговых сигналов (проверка каждые 5 минут) + недельный отчёт
 signal_tracker_thread = threading.Thread(target=signal_tracker_loop, daemon=True)
 signal_tracker_thread.start()
-
-# Брифинг перед открытием биржи США (за 30 мин до 9:30 Нью-Йорка, только торговые дни)
-us_premarket_thread = threading.Thread(target=us_premarket_loop, daemon=True)
-us_premarket_thread.start()
 scheduler.add_job(weekly_signal_report, "cron", day_of_week=WEEKLY_REPORT_DAY,
                   hour=dubai_to_utc_hour(WEEKLY_REPORT_HOUR_DUBAI), minute=0)
 
@@ -3683,6 +3679,10 @@ def test_storage():
         report["write_ok"] = False
         report["write_error"] = str(e)
     return json.dumps(report, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
+# Брифинг перед открытием биржи США (за 30 мин до 9:30 Нью-Йорка, только торговые дни)
+us_premarket_thread = threading.Thread(target=us_premarket_loop, daemon=True)
+us_premarket_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
