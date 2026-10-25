@@ -93,7 +93,30 @@ THREAD_TO_TF = {
     THREAD_12H: "720",
     THREAD_1D:  "D",
 }
-TF_LABEL = {"60": "1ч", "240": "4ч", "720": "12ч", "D": "1д"}
+TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д"}
+
+# ═══════════════════════════════════════════════
+# СИГНАЛЬНЫЕ ТЕМЫ UT BOT (30м / 1ч / 2ч / 4ч)
+# ═══════════════════════════════════════════════
+# ID новых тем создаются ботом через /setup_signal_topics и хранятся на Volume в
+# signal_topics.json — при старте подменяют TF_TO_THREAD / THREAD_TO_TF выше.
+SIGNAL_TOPICS_FILE = "signal_topics.json"
+SIGNAL_TOPIC_NAMES = [("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
+                      ("120", "сигналы 2 часа"), ("240", "сигналы 4 часа")]
+OLD_SIGNAL_THREADS = [THREAD_1H, THREAD_4H, THREAD_12H, THREAD_1D]   # старые темы — на удаление
+
+def apply_signal_topics():
+    data = load_json_file(SIGNAL_TOPICS_FILE, {})
+    if not data:
+        return False
+    TF_TO_THREAD.clear()
+    THREAD_TO_TF.clear()
+    for tf, tid in data.items():
+        TF_TO_THREAD[str(tf)] = int(tid)
+        THREAD_TO_TF[int(tid)] = str(tf)
+    return True
+
+apply_signal_topics()
 
 signal_buffer = []
 buffer_lock = threading.Lock()
@@ -513,7 +536,7 @@ def get_ticker_thread(ticker, tf="60"):
         return THREAD_RU
     if any(t.startswith(u) for u in US_TICKERS):
         return THREAD_US
-    return TF_TO_THREAD.get(str(tf), THREAD_1H)
+    return TF_TO_THREAD.get(str(tf))   # ТФ без своей темы -> General
 
 # ═══════════════════════════════════════════════
 # КРИПТО ДАННЫЕ
@@ -744,9 +767,6 @@ def process_buffer():
         signal_buffer = []
         buffer_timer = None
 
-    line = "------------------------------"
-    signals_header = ""
-
     # Пробои не публикуем в Telegram (решили по итогам 3 недель наблюдений) —
     # индикатор их по-прежнему считает, просто не шлём в чат
     SKIP_SIGNALS = ("BREAKOUT_UP", "BREAKOUT_DOWN")
@@ -755,12 +775,21 @@ def process_buffer():
     if not signals:
         return
 
-    # Определяем топик по первому сигналу
-    first = signals[0]
-    ticker = first.get("ticker", "")
-    tf     = str(first.get("tf", "60"))
-    thread_id = get_ticker_thread(ticker, tf)
+    # Сигналы разных таймфреймов приходят одновременно (закрытие 4ч совпадает с 2ч/1ч/30м),
+    # поэтому раскладываем их по темам и шлём отдельным сообщением в каждую.
+    groups = {}
+    for s in signals:
+        tid = get_ticker_thread(s.get("ticker", ""), str(s.get("tf", "60")))
+        groups.setdefault(tid, []).append(s)
+    for tid, group in groups.items():
+        try:
+            send_signal_group(group, tid)
+        except:
+            pass
 
+def send_signal_group(signals, thread_id):
+    line = "------------------------------"
+    signals_header = ""
     for s in signals:
         sig    = s.get("signal", "")
         ticker = s.get("ticker", "")
@@ -788,7 +817,18 @@ def process_buffer():
             emoji    = "&#9898;"     # ⚪
             sig_text = sig or "СИГНАЛ"
 
-        signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + "\n"
+        sig_tf = str(s.get("tf", "60"))
+        src_txt = ""
+        if str(s.get("src", "")).upper() in ("UT", "UTBOT", "UT_BOT"):
+            src_txt = "  · UT Bot " + TF_LABEL.get(sig_tf, sig_tf)
+        signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + src_txt + "\n"
+
+        # USDT.D — инверсный индикатор: рост доминации стейблов = давление на крипту
+        if "USDT.D" in ticker.upper():
+            if sig == "LONG":
+                signals_header += "&#9888; инверсия: рост USDT.D = давление на крипту\n"
+            elif sig == "SHORT":
+                signals_header += "&#9888; инверсия: падение USDT.D = поддержка крипты\n"
 
         target = s.get("target", "")
         stop   = s.get("stop", "")
@@ -803,11 +843,7 @@ def process_buffer():
             except:
                 pass
 
-        sig_tf = str(s.get("tf", "60"))
-        # Функции по-прежнему вызываются и пишут в trades.json (нужно для /stats24h,
-        # /statsweek, /statsmonth), но возвращаемый текст сравнения (P&L, ✅/❌,
-        # "Пред: ЛОНГ/ШОРТ...", "Закрыт ЛОНГ/ШОРТ...") в сообщение больше НЕ добавляется —
-        # в чат идёт только сам сигнал (тип, тикер, цена), без расчёта заработка.
+        # Пишут в trades.json (для /stats24h, /statsweek, /statsmonth) — в чат не выводится
         process_trade_signal(ticker, sig, price, sig_tf)
         process_return_signal(ticker, sig, price, sig_tf)
 
@@ -3834,6 +3870,49 @@ def test_signal_report():
     if request.args.get("send") == "1":
         send_telegram(text, THREAD_GENERAL)
     return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+def tg_api(method, payload):
+    try:
+        r = requests.post("https://api.telegram.org/bot" + BOT_TOKEN + "/" + method, json=payload, timeout=15)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+@app.route("/setup_signal_topics")
+def setup_signal_topics():
+    """Создаёт темы 30м/1ч/2ч/4ч (только недостающие) и сохраняет их ID. ?confirm=1 — выполнить."""
+    data = load_json_file(SIGNAL_TOPICS_FILE, {})
+    if request.args.get("confirm") != "1":
+        return json.dumps({"will_create": [n for tf, n in SIGNAL_TOPIC_NAMES if tf not in data],
+                           "existing": data}, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+    results = {}
+    for tf, name in SIGNAL_TOPIC_NAMES:
+        if tf in data:
+            results[tf] = "уже есть: " + str(data[tf])
+            continue
+        r = tg_api("createForumTopic", {"chat_id": GROUP_CHAT_ID, "name": name})
+        if r.get("ok"):
+            data[tf] = r["result"]["message_thread_id"]
+            results[tf] = "создана: " + str(data[tf])
+        else:
+            results[tf] = "ошибка: " + str(r.get("description"))
+    save_json_file(SIGNAL_TOPICS_FILE, data)
+    apply_signal_topics()
+    return json.dumps({"results": results, "tf_to_thread": TF_TO_THREAD}, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
+@app.route("/delete_old_signal_topics")
+def delete_old_signal_topics():
+    """Удаляет старые сигнальные темы (1ч/4ч/12ч/1д) ВМЕСТЕ С ИСТОРИЕЙ. ?confirm=1 — выполнить."""
+    if request.args.get("confirm") != "1":
+        return json.dumps({"will_delete": OLD_SIGNAL_THREADS}, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+    res = {}
+    for tid in OLD_SIGNAL_THREADS:
+        if tid in THREAD_TO_TF:
+            res[str(tid)] = "пропущена — это новая тема"
+            continue
+        r = tg_api("deleteForumTopic", {"chat_id": GROUP_CHAT_ID, "message_thread_id": tid})
+        res[str(tid)] = "удалена" if r.get("ok") else "ошибка: " + str(r.get("description"))
+    return json.dumps(res, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
 @app.route("/test_storage")
 def test_storage():
