@@ -118,6 +118,11 @@ def apply_signal_topics():
 
 apply_signal_topics()
 
+# Таймфреймы, сигналы которых ПУБЛИКУЮТСЯ в сигнальные темы. Сигналы остальных ТФ
+# (например 4ч) в чат не идут, но по-прежнему пишутся в журнал сделок для статистики.
+# Решение по итогам /statsmonth 10.11.2026: 30м, 2ч и 4ч убыточны, в плюсе только 1ч.
+PUBLISH_TFS = {"60"}
+
 signal_buffer = []
 buffer_lock = threading.Lock()
 buffer_timer = None
@@ -779,7 +784,17 @@ def process_buffer():
     # поэтому раскладываем их по темам и шлём отдельным сообщением в каждую.
     groups = {}
     for s in signals:
-        tid = get_ticker_thread(s.get("ticker", ""), str(s.get("tf", "60")))
+        s_ticker = s.get("ticker", "")
+        s_tf     = str(s.get("tf", "60"))
+        tid = get_ticker_thread(s_ticker, s_tf)
+        # Крипто-сигнал с ТФ не из PUBLISH_TFS: только в журнал, без сообщения в чат
+        if tid not in (THREAD_RU, THREAD_US) and s_tf not in PUBLISH_TFS:
+            try:
+                process_trade_signal(s_ticker, s.get("signal", ""), s.get("price", ""), s_tf)
+                process_return_signal(s_ticker, s.get("signal", ""), s.get("price", ""), s_tf)
+            except:
+                pass
+            continue
         groups.setdefault(tid, []).append(s)
     for tid, group in groups.items():
         try:
