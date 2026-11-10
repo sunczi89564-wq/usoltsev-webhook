@@ -93,7 +93,7 @@ THREAD_TO_TF = {
     THREAD_12H: "720",
     THREAD_1D:  "D",
 }
-TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д"}
+TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д", "CF": "совпадение 1ч"}
 
 # ═══════════════════════════════════════════════
 # СИГНАЛЬНЫЕ ТЕМЫ UT BOT (30м / 1ч / 2ч / 4ч)
@@ -118,10 +118,15 @@ def apply_signal_topics():
 
 apply_signal_topics()
 
-# Таймфреймы, сигналы которых ПУБЛИКУЮТСЯ в сигнальные темы. Сигналы остальных ТФ
-# (например 4ч) в чат не идут, но по-прежнему пишутся в журнал сделок для статистики.
-# Решение по итогам /statsmonth 10.11.2026: 30м, 2ч и 4ч убыточны, в плюсе только 1ч.
-PUBLISH_TFS = {"60"}
+# Источники крипто-сигналов, которые ПУБЛИКУЮТСЯ в сигнальные темы. Сигналы остальных
+# источников (UT Bot, отбои индикатора) в чат не идут, но по-прежнему пишутся в журнал
+# сделок под своим таймфреймом. Решение 10.11.2026 по итогам тестов на истории:
+# публикуем только "CF" — полное совпадение UT Bot + SMA10 + EMA50 + MACD на 1ч.
+PUBLISH_SRC = {"CF"}
+CF_JOURNAL_TF = "CF"     # ключ журнала для сигналов совпадения (отдельно от UT Bot 1ч)
+
+def signal_src(s):
+    return str(s.get("src", "")).upper()
 
 signal_buffer = []
 buffer_lock = threading.Lock()
@@ -787,8 +792,8 @@ def process_buffer():
         s_ticker = s.get("ticker", "")
         s_tf     = str(s.get("tf", "60"))
         tid = get_ticker_thread(s_ticker, s_tf)
-        # Крипто-сигнал с ТФ не из PUBLISH_TFS: только в журнал, без сообщения в чат
-        if tid not in (THREAD_RU, THREAD_US) and s_tf not in PUBLISH_TFS:
+        # Крипто-сигнал не из PUBLISH_SRC: только в журнал, без сообщения в чат
+        if tid not in (THREAD_RU, THREAD_US) and signal_src(s) not in PUBLISH_SRC:
             try:
                 process_trade_signal(s_ticker, s.get("signal", ""), s.get("price", ""), s_tf)
                 process_return_signal(s_ticker, s.get("signal", ""), s.get("price", ""), s_tf)
@@ -834,9 +839,15 @@ def send_signal_group(signals, thread_id):
 
         sig_tf = str(s.get("tf", "60"))
         src_txt = ""
-        if str(s.get("src", "")).upper() in ("UT", "UTBOT", "UT_BOT"):
+        is_cf = signal_src(s) == "CF"
+        if signal_src(s) in ("UT", "UTBOT", "UT_BOT"):
             src_txt = "  · UT Bot " + TF_LABEL.get(sig_tf, sig_tf)
+        elif is_cf:
+            src_txt = "  · Совпадение " + TF_LABEL.get(sig_tf, sig_tf)
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + src_txt + "\n"
+        if is_cf:
+            signals_header += ("UT Bot + SMA10 + EMA50 + MACD в одну сторону.\n"
+                               "Держать до совпадения в обратную сторону; противоположная позиция закрывается.\n")
 
         # USDT.D — инверсный индикатор: рост доминации стейблов = давление на крипту
         if "USDT.D" in ticker.upper():
@@ -859,8 +870,9 @@ def send_signal_group(signals, thread_id):
                 pass
 
         # Пишут в trades.json (для /stats24h, /statsweek, /statsmonth) — в чат не выводится
-        process_trade_signal(ticker, sig, price, sig_tf)
-        process_return_signal(ticker, sig, price, sig_tf)
+        journal_tf = CF_JOURNAL_TF if is_cf else sig_tf
+        process_trade_signal(ticker, sig, price, journal_tf)
+        process_return_signal(ticker, sig, price, journal_tf)
 
     signal_count = len(signals)
     if signal_count > 1:
@@ -1338,6 +1350,12 @@ def telegram_updates():
     text      = (msg.get("text") or "").strip()
     thread_id = msg.get("message_thread_id")
     tf_filter = THREAD_TO_TF.get(thread_id)  # None если тема не привязана к ТФ (например General)
+    # "/statsmonth cf" — статистика только по сигналам совпадения, "/statsmonth ut" — только UT Bot этой темы
+    _stat_args = [a.lower() for a in text.split()[1:]]
+    if "cf" in _stat_args:
+        tf_filter = CF_JOURNAL_TF
+    elif tf_filter == "60" and "ut" not in _stat_args and text.startswith("/stats"):
+        tf_filter = CF_JOURNAL_TF   # в теме 1ч по умолчанию показываем опубликованные сигналы (совпадение)
 
     if text.startswith("/stats24h"):
         send_telegram(format_stats("24 ЧАСА", 24, tf_filter), thread_id)
