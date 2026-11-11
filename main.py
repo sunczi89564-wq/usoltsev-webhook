@@ -102,7 +102,7 @@ TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч"
 # ID новых тем создаются ботом через /setup_signal_topics и хранятся на Volume в
 # signal_topics.json — при старте подменяют TF_TO_THREAD / THREAD_TO_TF выше.
 SIGNAL_TOPICS_FILE = "signal_topics.json"
-SIGNAL_TOPIC_NAMES = [("SV15", "связка 15 мин"), ("15", "сигналы 15 мин"), ("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
+SIGNAL_TOPIC_NAMES = [("SV15", "связка 15 мин"), ("SV60", "связка 1 час"), ("15", "сигналы 15 мин"), ("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
                       ("120", "сигналы 2 часа"), ("240", "сигналы 4 часа")]
 OLD_SIGNAL_THREADS = [THREAD_1H, THREAD_4H, THREAD_12H, THREAD_1D]   # старые темы — на удаление
 
@@ -331,7 +331,13 @@ def f_price(p):
     except:
         return None
 
+def is_non_tradable(ticker):
+    """Индексы доминации (USDT.D, BTC.D и т.п.) — ими нельзя торговать, в журнал сделок не пишем."""
+    return str(ticker).upper().endswith(".D")
+
 def process_trade_signal(ticker, sig, price, tf="60"):
+    if is_non_tradable(ticker):
+        return
     """Обрабатывает LONG/SHORT сигнал: закрывает предыдущую позицию по тикеру+таймфрейму
     (если была) и открывает новую. Позиции 5м и 15м по одному тикеру независимы.
     Возвращает текст сравнения (используется только для внутреннего учёта / статистики,
@@ -414,6 +420,8 @@ def process_trade_signal(ticker, sig, price, tf="60"):
     return compare_text
 
 def process_return_signal(ticker, sig, price, tf="60"):
+    if is_non_tradable(ticker):
+        return
     """Возврат в канал как сигнал ЗАКРЫТИЯ противоположной позиции:
     RETURN_SHORT (импульс вверх выдохся) закрывает открытый LONG,
     RETURN_LONG (импульс вниз выдохся) закрывает открытый SHORT.
