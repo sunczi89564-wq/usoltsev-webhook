@@ -76,7 +76,12 @@ THREAD_12H      = 582                # 12 часов сигналы
 THREAD_1D       = 584                # 1 день сигналы
 THREAD_RU       = 15                 # RU Market
 THREAD_US       = 18                 # US Market
-THREAD_WHALE    = 591                # Whale Alerts
+THREAD_WHALE    = 591                # Whale Alerts (тема удалена 11.11.2026)
+# Киты (биржевые и ончейн), журнал китов и алерты по всплескам объёма отключены полностью
+# 11.11.2026 по решению владельца: потоки не запускаются, в анализ BTC данные не передаются.
+# Код модулей оставлен; чтобы вернуть — поставить True и задеплоить.
+WHALES_ENABLED  = False
+VOLUME_ENABLED  = False
 THREAD_VOLUME   = 1092               # Volume Alert (всплески среднего объёма по нашим тикерам)
 
 # Таймфреймы → топики (для крипто)
@@ -1394,6 +1399,9 @@ def telegram_updates():
             days = max(1, min(int(parts[1]), 180))
         send_telegram(format_forecast_report(days), thread_id)
     elif text.startswith("/whalestats"):
+        if not WHALES_ENABLED:
+            send_telegram("Отслеживание китов отключено.", thread_id)
+            return "ok", 200
         parts = text.split()
         days = 30
         if len(parts) > 1 and parts[1].isdigit():
@@ -1513,7 +1521,8 @@ def flush_whale_alerts():
 # Дайджест (daily_report) снят с расписания 11.11.2026 — его функции закрывает анализ BTC
 # с макрофоном. Функция и /test_morning оставлены на случай ручного запуска.
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(flush_whale_alerts, "interval", hours=4)
+if WHALES_ENABLED:
+    scheduler.add_job(flush_whale_alerts, "interval", hours=4)
 scheduler.start()
 
 # ═══════════════════════════════════════════════
@@ -2241,8 +2250,8 @@ def run_btc_analysis(send=True):
         return None, "Не удалось получить достаточно свечей BTC с Bybit"
 
     news = get_crypto_news_headlines()
-    whale_summary = get_last_whale_summary_text()
-    volume_summary = get_last_volume_summary_text()
+    whale_summary = get_last_whale_summary_text() if WHALES_ENABLED else None
+    volume_summary = get_last_volume_summary_text() if VOLUME_ENABLED else None
 
     macro_lines = get_macro_lines()
     deriv_lines = get_btc_derivatives_lines()
@@ -2821,16 +2830,19 @@ price_thread = threading.Thread(target=price_tracker_loop, daemon=True)
 price_thread.start()
 
 # Фоновый поток отслеживания китовых сделок (крупные сделки на бирже)
-whale_thread = threading.Thread(target=whale_tracker_loop, daemon=True)
-whale_thread.start()
+if WHALES_ENABLED:
+    whale_thread = threading.Thread(target=whale_tracker_loop, daemon=True)
+    whale_thread.start()
 
 # Фоновый поток ончейн-китов (спотовые закупки Ethereum + Solana)
-onchain_thread = threading.Thread(target=onchain_whale_loop, daemon=True)
-onchain_thread.start()
+if WHALES_ENABLED:
+    onchain_thread = threading.Thread(target=onchain_whale_loop, daemon=True)
+    onchain_thread.start()
 
 # Фоновый поток алертов по всплескам объёма (наши тикеры)
-volume_thread = threading.Thread(target=volume_alert_loop, daemon=True)
-volume_thread.start()
+if VOLUME_ENABLED:
+    volume_thread = threading.Thread(target=volume_alert_loop, daemon=True)
+    volume_thread.start()
 
 # Фоновый поток анализа BTC (Claude Opus 5, 06:00 / 14:00 / 22:00 по Дубаю)
 btc_analysis_thread = threading.Thread(target=btc_analysis_loop, daemon=True)
@@ -3308,6 +3320,24 @@ def delete_old_signal_topics():
         res[str(tid)] = "удалена" if r.get("ok") else "ошибка: " + str(r.get("description"))
     return json.dumps(res, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
+@app.route("/delete_topics")
+def delete_topics():
+    """Удаляет темы группы ВМЕСТЕ С ИСТОРИЕЙ по списку id: /delete_topics?ids=591,1092&confirm=1.
+    Темы, в которые бот сейчас публикует сигналы, пропускаются."""
+    raw = request.args.get("ids", "")
+    ids = [int(x) for x in raw.split(",") if x.strip().isdigit()]
+    if request.args.get("confirm") != "1":
+        return json.dumps({"will_delete": ids, "active_signal_topics": TF_TO_THREAD}, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+    protected = {TF_TO_THREAD.get(k) for k in ("15", "60", "SV15", "SV60")} | {THREAD_RU, THREAD_US, THREAD_ASK_ANALYSIS}
+    res = {}
+    for tid in ids:
+        if tid in protected:
+            res[str(tid)] = "пропущена — рабочая тема"
+            continue
+        r = tg_api("deleteForumTopic", {"chat_id": GROUP_CHAT_ID, "message_thread_id": tid})
+        res[str(tid)] = "удалена" if r.get("ok") else "ошибка: " + str(r.get("description"))
+    return json.dumps(res, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
 @app.route("/test_storage")
 def test_storage():
     """Проверка Volume: куда пишутся данные и что там лежит."""
@@ -3631,10 +3661,11 @@ us_premarket_thread = threading.Thread(target=us_premarket_loop, daemon=True)
 us_premarket_thread.start()
 
 # Журнал китов: дописывание цен через 4/12/24ч + еженедельный отчёт в Whale Alerts
-whale_journal_thread = threading.Thread(target=whale_journal_loop, daemon=True)
-whale_journal_thread.start()
-scheduler.add_job(weekly_whale_report, "cron", day_of_week="sun",
-                  hour=dubai_to_utc_hour(WHALE_WEEKLY_HOUR_DUBAI), minute=WHALE_WEEKLY_MINUTE)
+if WHALES_ENABLED:
+    whale_journal_thread = threading.Thread(target=whale_journal_loop, daemon=True)
+    whale_journal_thread.start()
+    scheduler.add_job(weekly_whale_report, "cron", day_of_week="sun",
+                      hour=dubai_to_utc_hour(WHALE_WEEKLY_HOUR_DUBAI), minute=WHALE_WEEKLY_MINUTE)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
