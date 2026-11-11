@@ -93,7 +93,7 @@ THREAD_TO_TF = {
     THREAD_12H: "720",
     THREAD_1D:  "D",
 }
-TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д", "15": "15м", "CF": "совпадение 1ч", "CF15": "совпадение 15м"}
+TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д", "15": "15м", "CF": "совпадение 1ч", "CF15": "совпадение 15м", "SV15": "связка 15м", "SV60": "связка 1ч"}
 
 # ═══════════════════════════════════════════════
 # СИГНАЛЬНЫЕ ТЕМЫ UT BOT (30м / 1ч / 2ч / 4ч)
@@ -101,7 +101,7 @@ TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч"
 # ID новых тем создаются ботом через /setup_signal_topics и хранятся на Volume в
 # signal_topics.json — при старте подменяют TF_TO_THREAD / THREAD_TO_TF выше.
 SIGNAL_TOPICS_FILE = "signal_topics.json"
-SIGNAL_TOPIC_NAMES = [("15", "сигналы 15 мин"), ("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
+SIGNAL_TOPIC_NAMES = [("SV15", "связка 15 мин"), ("15", "сигналы 15 мин"), ("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
                       ("120", "сигналы 2 часа"), ("240", "сигналы 4 часа")]
 OLD_SIGNAL_THREADS = [THREAD_1H, THREAD_4H, THREAD_12H, THREAD_1D]   # старые темы — на удаление
 
@@ -122,7 +122,7 @@ apply_signal_topics()
 # источников (UT Bot, отбои индикатора) в чат не идут, но по-прежнему пишутся в журнал
 # сделок под своим таймфреймом. Решение 10.11.2026 по итогам тестов на истории:
 # публикуем только "CF" — полное совпадение UT Bot + SMA10 + EMA50 + MACD на 1ч.
-PUBLISH_SRC = {"CF"}
+PUBLISH_SRC = {"CF", "SV"}   # CF — совпадение (UT+SMA10+EMA50+MACD), SV — связка (отбой+UT+MACD+RSI)
 CF_JOURNAL_TF = "CF"     # ключ журнала для сигналов совпадения 1ч (отдельно от UT Bot 1ч)
 
 def cf_journal_tf(tf):
@@ -798,6 +798,9 @@ def process_buffer():
         s_ticker = s.get("ticker", "")
         s_tf     = str(s.get("tf", "60"))
         tid = get_ticker_thread(s_ticker, s_tf)
+        # Сигналы связки идут в свою тему ("SV" + ТФ), чтобы не смешиваться с сигналами совпадения
+        if signal_src(s) == "SV" and tid not in (THREAD_RU, THREAD_US):
+            tid = TF_TO_THREAD.get("SV" + s_tf)
         # Крипто-сигнал не из PUBLISH_SRC: только в журнал, без сообщения в чат
         if tid not in (THREAD_RU, THREAD_US) and signal_src(s) not in PUBLISH_SRC:
             try:
@@ -846,14 +849,19 @@ def send_signal_group(signals, thread_id):
         sig_tf = str(s.get("tf", "60"))
         src_txt = ""
         is_cf = signal_src(s) == "CF"
+        is_sv = signal_src(s) == "SV"
         if signal_src(s) in ("UT", "UTBOT", "UT_BOT"):
             src_txt = "  · UT Bot " + TF_LABEL.get(sig_tf, sig_tf)
         elif is_cf:
             src_txt = "  · Совпадение " + TF_LABEL.get(sig_tf, sig_tf)
+        elif is_sv:
+            src_txt = "  · Связка " + TF_LABEL.get(sig_tf, sig_tf)
         signals_header += emoji + " <b>" + sig_text + " - " + ticker + "</b>  $" + str(price) + src_txt + "\n"
         if is_cf:
             signals_header += ("UT Bot + SMA10 + EMA50 + MACD в одну сторону.\n"
                                "Держать до совпадения в обратную сторону; противоположная позиция закрывается.\n")
+        if is_sv:
+            signals_header += "Отбой от канала + UT Bot + MACD + разворот RSI.\n"
 
         # USDT.D — инверсный индикатор: рост доминации стейблов = давление на крипту
         if "USDT.D" in ticker.upper():
@@ -876,7 +884,7 @@ def send_signal_group(signals, thread_id):
                 pass
 
         # Пишут в trades.json (для /stats24h, /statsweek, /statsmonth) — в чат не выводится
-        journal_tf = cf_journal_tf(sig_tf) if is_cf else sig_tf
+        journal_tf = cf_journal_tf(sig_tf) if is_cf else ("SV" + sig_tf if is_sv else sig_tf)
         process_trade_signal(ticker, sig, price, journal_tf)
         process_return_signal(ticker, sig, price, journal_tf)
 
