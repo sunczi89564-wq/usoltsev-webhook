@@ -93,7 +93,7 @@ THREAD_TO_TF = {
     THREAD_12H: "720",
     THREAD_1D:  "D",
 }
-TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д", "CF": "совпадение 1ч"}
+TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д", "15": "15м", "CF": "совпадение 1ч", "CF15": "совпадение 15м"}
 
 # ═══════════════════════════════════════════════
 # СИГНАЛЬНЫЕ ТЕМЫ UT BOT (30м / 1ч / 2ч / 4ч)
@@ -101,7 +101,7 @@ TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч"
 # ID новых тем создаются ботом через /setup_signal_topics и хранятся на Volume в
 # signal_topics.json — при старте подменяют TF_TO_THREAD / THREAD_TO_TF выше.
 SIGNAL_TOPICS_FILE = "signal_topics.json"
-SIGNAL_TOPIC_NAMES = [("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
+SIGNAL_TOPIC_NAMES = [("15", "сигналы 15 мин"), ("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
                       ("120", "сигналы 2 часа"), ("240", "сигналы 4 часа")]
 OLD_SIGNAL_THREADS = [THREAD_1H, THREAD_4H, THREAD_12H, THREAD_1D]   # старые темы — на удаление
 
@@ -123,7 +123,13 @@ apply_signal_topics()
 # сделок под своим таймфреймом. Решение 10.11.2026 по итогам тестов на истории:
 # публикуем только "CF" — полное совпадение UT Bot + SMA10 + EMA50 + MACD на 1ч.
 PUBLISH_SRC = {"CF"}
-CF_JOURNAL_TF = "CF"     # ключ журнала для сигналов совпадения (отдельно от UT Bot 1ч)
+CF_JOURNAL_TF = "CF"     # ключ журнала для сигналов совпадения 1ч (отдельно от UT Bot 1ч)
+
+def cf_journal_tf(tf):
+    """Ключ журнала для сигнала совпадения: 1ч -> "CF" (как раньше), остальные ТФ -> "CF15" и т.п.,
+    чтобы сделки разных таймфреймов не смешивались."""
+    tf = str(tf)
+    return CF_JOURNAL_TF if tf == "60" else CF_JOURNAL_TF + tf
 
 def signal_src(s):
     return str(s.get("src", "")).upper()
@@ -870,7 +876,7 @@ def send_signal_group(signals, thread_id):
                 pass
 
         # Пишут в trades.json (для /stats24h, /statsweek, /statsmonth) — в чат не выводится
-        journal_tf = CF_JOURNAL_TF if is_cf else sig_tf
+        journal_tf = cf_journal_tf(sig_tf) if is_cf else sig_tf
         process_trade_signal(ticker, sig, price, journal_tf)
         process_return_signal(ticker, sig, price, journal_tf)
 
@@ -1352,10 +1358,11 @@ def telegram_updates():
     tf_filter = THREAD_TO_TF.get(thread_id)  # None если тема не привязана к ТФ (например General)
     # "/statsmonth cf" — статистика только по сигналам совпадения, "/statsmonth ut" — только UT Bot этой темы
     _stat_args = [a.lower() for a in text.split()[1:]]
-    if "cf" in _stat_args:
-        tf_filter = CF_JOURNAL_TF
-    elif tf_filter == "60" and "ut" not in _stat_args and text.startswith("/stats"):
-        tf_filter = CF_JOURNAL_TF   # в теме 1ч по умолчанию показываем опубликованные сигналы (совпадение)
+    if text.startswith("/stats") and "ut" not in _stat_args:
+        if tf_filter in ("60", "15"):
+            tf_filter = cf_journal_tf(tf_filter)   # в темах 1ч и 15м по умолчанию — опубликованные сигналы совпадения
+        elif "cf" in _stat_args:
+            tf_filter = CF_JOURNAL_TF
 
     if text.startswith("/stats24h"):
         send_telegram(format_stats("24 ЧАСА", 24, tf_filter), thread_id)
