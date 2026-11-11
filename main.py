@@ -7,6 +7,7 @@ import json
 import xml.etree.ElementTree as ET
 import threading
 import time
+import re
 
 app = Flask(__name__)
 
@@ -1378,6 +1379,12 @@ def telegram_updates():
         send_telegram(format_stats("НЕДЕЛЯ", 24 * 7, tf_filter), thread_id)
     elif text.startswith("/statsmonth"):
         send_telegram(format_stats("МЕСЯЦ", 24 * 30, tf_filter), thread_id)
+    elif text.startswith("/forecaststats"):
+        parts = text.split()
+        days = 30
+        if len(parts) > 1 and parts[1].isdigit():
+            days = max(1, min(int(parts[1]), 180))
+        send_telegram(format_forecast_report(days), thread_id)
     elif text.startswith("/whalestats"):
         parts = text.split()
         days = 30
@@ -1495,11 +1502,9 @@ def flush_whale_alerts():
     )
     send_telegram(text, THREAD_WHALE)
 
-# Дайджест: 08:00 / 14:00 / 18:00 по Дубаю. Планировщик явно в UTC, часы переводим.
-DIGEST_HOURS_DUBAI = [8, 14, 18]
+# Дайджест (daily_report) снят с расписания 11.11.2026 — его функции закрывает анализ BTC
+# с макрофоном. Функция и /test_morning оставлены на случай ручного запуска.
 scheduler = BackgroundScheduler(timezone="UTC")
-for _h in DIGEST_HOURS_DUBAI:
-    scheduler.add_job(daily_report, "cron", hour=dubai_to_utc_hour(_h), minute=0)
 scheduler.add_job(flush_whale_alerts, "interval", hours=4)
 scheduler.start()
 
@@ -2078,7 +2083,8 @@ def call_claude_opus(system_prompt, user_prompt, max_tokens=1500):
     except Exception as e:
         return None, "OTHER: " + type(e).__name__ + ": " + str(e)
 
-def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary):
+def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary,
+                              macro_lines=None, deriv_lines=None, calendar_lines=None):
     """Собирает system + user промпт для Opus на основе готовых Python-расчётов
     и сырого контекста (свечи/новости/наши собственные данные)."""
     system_prompt = (
@@ -2092,12 +2098,31 @@ def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary):
         "3) 2-3 сценария (например 'Пробой вниз', 'Боковик', 'Отскок вверх'), каждый с "
         "оценкой вероятности в % (сумма всех сценариев = 100%), кратким описанием, "
         "конкретным триггером (что должно произойти технически) и целевым уровнем.\n"
-        "4) Блок 'Суть дня:' — 2-3 предложения итогового вывода и на что смотреть.\n\n"
+        "4) Блок 'Макрофон и деривативы:' — 2-4 предложения: что показывают доходности, "
+        "доллар, иена, золото, нефть, VIX и фьючерсы на индексы, что показывают ставка "
+        "финансирования, открытый интерес и соотношение лонгов/шортов, какие события "
+        "календаря впереди. Отдельной фразой скажи, ПОДДЕРЖИВАЕТ этот фон основной "
+        "сценарий или ПРОТИВОРЕЧИТ ему. Если макроданные помечены как устаревшие "
+        "(рынок закрыт) — скажи об этом и не делай из них сильных выводов.\n"
+        "5) Блок 'Суть дня:' — 2-3 предложения итогового вывода и на что смотреть.\n\n"
+        "Как читать макро: рост доходности US10Y и DXY — давление на рисковые активы и BTC; "
+        "резкое падение USDJPY (укрепление иены) — риск сворачивания кэрри-трейда и распродаж; "
+        "рост золота при падающем DXY — уход от доллара, для BTC скорее плюс; рост VIX — уход "
+        "от риска; сильные фьючерсы Nasdaq/S&P — аппетит к риску. Как читать деривативы: "
+        "высокая положительная ставка финансирования при растущем открытом интересе — "
+        "перегретые лонги, риск каскада ликвидаций вниз; отрицательная ставка при росте "
+        "интереса — перегретые шорты, риск шорт-сквиза; падение открытого интереса вместе "
+        "с ценой — закрытие позиций, а не новый тренд.\n\n"
         "Проценты вероятности — твоя экспертная оценка на основе предоставленных цифр, "
         "истории свечей и новостного фона. Не выдумывай технические цифры (EMA, RSI, "
         "уровни) — используй ТОЛЬКО те, что даны тебе явно ниже, они посчитаны точно "
         "по формулам. Свечи и новости — это твой контекст для оценки вероятностей и "
-        "рассуждения, не источник для новых числовых расчётов."
+        "рассуждения, не источник для новых числовых расчётов.\n\n"
+        "Весь обзор — не длиннее 3000 символов (ограничение Telegram), пиши плотно.\n\n"
+        "В САМОМ КОНЦЕ ответа, отдельной последней строкой, без пояснений, выведи "
+        "машинную строку основного (самого вероятного) сценария на ближайшие 24 часа в формате:\n"
+        "FORECAST|<UP или DOWN или FLAT>|<вероятность, целое число %>|<целевой уровень, число>|<уровень отмены сценария, число>\n"
+        "Пример: FORECAST|DOWN|55|71500|75200"
     )
 
     lines = []
@@ -2123,6 +2148,24 @@ def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary):
             lines.append("- " + h)
     else:
         lines.append("(новости недоступны в этот раз)")
+
+    if macro_lines:
+        lines.append("")
+        lines.append("МАКРОФОН (Yahoo; значение, изменение за день и за ~неделю):")
+        lines.extend(macro_lines)
+
+    if deriv_lines:
+        lines.append("")
+        lines.append("ДЕРИВАТИВЫ BTC (Bybit, бессрочный контракт BTCUSDT):")
+        lines.extend(deriv_lines)
+
+    if calendar_lines is not None:
+        lines.append("")
+        lines.append("КАЛЕНДАРЬ США, БЛИЖАЙШИЕ 48 ЧАСОВ (время Дубая, важность High/Medium):")
+        if calendar_lines:
+            lines.extend(calendar_lines)
+        else:
+            lines.append("(значимых событий нет)")
 
     if whale_summary:
         lines.append("")
@@ -2193,10 +2236,20 @@ def run_btc_analysis(send=True):
     whale_summary = get_last_whale_summary_text()
     volume_summary = get_last_volume_summary_text()
 
-    system_prompt, user_prompt = build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary)
-    text, error = call_claude_opus(system_prompt, user_prompt)
+    macro_lines = get_macro_lines()
+    deriv_lines = get_btc_derivatives_lines()
+    calendar_lines = get_us_calendar_upcoming(48)
+
+    system_prompt, user_prompt = build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary,
+                                                            macro_lines, deriv_lines, calendar_lines)
+    text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=2200)
     if error:
         return None, error
+
+    # Машинная строка прогноза: вырезаем из текста и (при реальной отправке) пишем в журнал
+    text, forecast = extract_forecast_line(text)
+    if send and forecast:
+        forecast_journal_record(forecast, metrics["price"])
 
     line = "------------------------------"
     full_text = (
@@ -2840,6 +2893,7 @@ US_MACRO_SYMBOLS = [
     ("^VIX",      "VIX",            "risk"),
     ("DX-Y.NYB",  "DXY",            "risk"),
     ("^TNX",      "US10Y, %",       "risk"),
+    ("JPY=X",     "USDJPY",         "risk"),
     ("CL=F",      "Нефть WTI",      "risk"),
     ("GC=F",      "Золото",         "risk"),
 ]
@@ -3271,6 +3325,298 @@ def test_storage():
         report["write_ok"] = False
         report["write_error"] = str(e)
     return json.dumps(report, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
+# ═══════════════════════════════════════════════
+# МАКРОФОН, ДЕРИВАТИВЫ И ЖУРНАЛ ПРОГНОЗОВ ДЛЯ АНАЛИЗА BTC
+# ═══════════════════════════════════════════════
+# Макро (Yahoo): US10Y, DXY, USDJPY, золото, нефть WTI/Brent, VIX, фьючерсы S&P и Nasdaq —
+# значение, изменение за день и за ~неделю. Индексы и доходности обновляются только в часы
+# работы бирж, поэтому при устаревшей котировке строка помечается.
+# Деривативы (Bybit): ставка финансирования, открытый интерес и его изменение за 24ч,
+# соотношение лонгов/шортов по аккаунтам.
+# Журнал прогнозов: основной сценарий каждого анализа (направление, вероятность, цель,
+# уровень отмены) пишется в forecast_journal.json; через 24 часа бот отмечает, что произошло.
+# Отчёт: /forecaststats [дней].
+BTC_MACRO_SYMBOLS = [
+    ("^TNX",     "US10Y (доходность, %)", "yield"),
+    ("DX-Y.NYB", "DXY (индекс доллара)",  "px"),
+    ("JPY=X",    "USDJPY",                "px"),
+    ("GC=F",     "Золото",                "px"),
+    ("CL=F",     "Нефть WTI",             "px"),
+    ("BZ=F",     "Нефть Brent",           "px"),
+    ("^VIX",     "VIX",                   "px"),
+    ("ES=F",     "S&P 500 (фьючерс)",     "px"),
+    ("NQ=F",     "Nasdaq (фьючерс)",      "px"),
+]
+MACRO_STALE_HOURS = 6
+
+def yahoo_series(symbol):
+    """Последняя цена, предыдущее закрытие, закрытие ~неделю назад и время котировки (сек) по Yahoo.
+    Возвращает dict или None."""
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=1mo"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get(url, headers=headers, timeout=8).json()
+        res = r["chart"]["result"][0]
+        meta = res.get("meta", {})
+        closes = [x for x in res["indicators"]["quote"][0]["close"] if x is not None]
+        price = meta.get("regularMarketPrice")
+        if price is None and closes:
+            price = closes[-1]
+        if price is None:
+            return None
+        prev = closes[-2] if len(closes) >= 2 else None
+        week = closes[-6] if len(closes) >= 6 else None
+        return {"price": float(price), "prev": prev, "week": week, "ts": meta.get("regularMarketTime")}
+    except:
+        return None
+
+def get_macro_lines():
+    """Строки макрофона для промпта. Пустой список, если Yahoo недоступен."""
+    out = []
+    now_ts = time.time()
+    for symbol, label, kind in BTC_MACRO_SYMBOLS:
+        q = yahoo_series(symbol)
+        if not q:
+            continue
+        try:
+            price = q["price"]
+            if kind == "yield":
+                txt = label + ": " + "{:.3f}".format(price)
+                if q["prev"]:
+                    txt += ", за день " + "{:+.1f}".format((price - q["prev"]) * 100) + " б.п."
+                if q["week"]:
+                    txt += ", за неделю " + "{:+.1f}".format((price - q["week"]) * 100) + " б.п."
+            else:
+                txt = label + ": " + "{:,.2f}".format(price)
+                if q["prev"]:
+                    txt += ", за день " + "{:+.2f}".format((price - q["prev"]) / q["prev"] * 100) + "%"
+                if q["week"]:
+                    txt += ", за неделю " + "{:+.2f}".format((price - q["week"]) / q["week"] * 100) + "%"
+            if q.get("ts"):
+                age_h = (now_ts - float(q["ts"])) / 3600
+                if age_h > MACRO_STALE_HOURS:
+                    txt += "  [УСТАРЕЛО: рынок закрыт, котировка " + str(int(age_h)) + " ч назад]"
+            out.append(txt)
+        except:
+            continue
+    return out
+
+def get_btc_derivatives_lines(symbol="BTCUSDT"):
+    """Ставка финансирования, открытый интерес (+изменение за 24ч), лонги/шорты по Bybit."""
+    out = []
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=" + symbol, timeout=8).json()
+        t = r.get("result", {}).get("list", [])[0]
+        fr = float(t.get("fundingRate") or 0) * 100
+        out.append("Ставка финансирования (за 8ч): " + "{:+.4f}".format(fr) + "%  (в годовых ~" + "{:+.1f}".format(fr * 3 * 365) + "%)")
+        oi_val = float(t.get("openInterestValue") or 0)
+        if oi_val > 0:
+            out.append("Открытый интерес: $" + "{:,.0f}".format(oi_val / 1e6) + " млн")
+    except:
+        pass
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/open-interest?category=linear&symbol=" + symbol
+                         + "&intervalTime=1h&limit=25", timeout=8).json()
+        lst = r.get("result", {}).get("list", [])
+        if len(lst) >= 25:
+            oi_now = float(lst[0]["openInterest"])
+            oi_24h = float(lst[24]["openInterest"])
+            if oi_24h > 0:
+                out.append("Изменение открытого интереса за 24ч: " + "{:+.2f}".format((oi_now - oi_24h) / oi_24h * 100) + "%")
+    except:
+        pass
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/account-ratio?category=linear&symbol=" + symbol
+                         + "&period=1h&limit=1", timeout=8).json()
+        lst = r.get("result", {}).get("list", [])
+        if lst:
+            buy = float(lst[0]["buyRatio"]) * 100
+            out.append("Аккаунты в лонге / в шорте: " + "{:.1f}".format(buy) + "% / " + "{:.1f}".format(100 - buy) + "%")
+    except:
+        pass
+    return out
+
+def get_us_calendar_upcoming(hours=48):
+    """События США (High/Medium) на ближайшие N часов для промпта. None — календарь недоступен."""
+    try:
+        r = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        events = r.json()
+    except:
+        return None
+    now = now_local()
+    out = []
+    for e in events:
+        try:
+            if e.get("country") != "USD" or e.get("impact") not in ("High", "Medium"):
+                continue
+            dt = datetime.fromisoformat(e["date"]).astimezone(DUBAI_TZ)
+            delta_h = (dt - now).total_seconds() / 3600
+            if delta_h < -3 or delta_h > hours:
+                continue
+            extra = []
+            if e.get("forecast"):
+                extra.append("прогноз " + str(e["forecast"]))
+            if e.get("previous"):
+                extra.append("пред. " + str(e["previous"]))
+            when = "уже вышло" if delta_h < 0 else "через " + str(int(delta_h)) + " ч"
+            out.append((dt, dt.strftime("%d.%m %H:%M") + " (" + when + ") · " + str(e.get("impact")) + " · "
+                        + str(e.get("title", "")) + (" (" + ", ".join(extra) + ")" if extra else "")))
+        except:
+            continue
+    out.sort(key=lambda x: x[0])
+    return [x[1] for x in out]
+
+# ----- Журнал прогнозов -----
+FORECAST_FILE         = "forecast_journal.json"
+FORECAST_HORIZON_H    = 24
+FORECAST_FLAT_PCT     = 0.5      # движение меньше этого за 24ч считается боковиком
+FORECAST_MAX_ENTRIES  = 600
+forecast_lock = threading.Lock()
+
+def extract_forecast_line(text):
+    """Вырезает из ответа модели строку FORECAST|DIR|PROB|TARGET|INVALID. Возвращает (текст_без_строки, dict|None)."""
+    forecast = None
+    kept = []
+    for ln in (text or "").split("\n"):
+        mt = re.search(r"FORECAST\s*\|\s*(UP|DOWN|FLAT)\s*\|\s*(\d{1,3})\s*%?\s*\|\s*\$?([\d\s.,]+)\s*\|\s*\$?([\d\s.,]+)", ln, re.I)
+        if mt and forecast is None:
+            try:
+                def _num(x):
+                    return float(x.replace(" ", "").replace(",", ""))
+                forecast = {"dir": mt.group(1).upper(), "prob": int(mt.group(2)),
+                            "target": _num(mt.group(3)), "invalid": _num(mt.group(4))}
+            except:
+                forecast = None
+            continue
+        kept.append(ln)
+    return "\n".join(kept).rstrip(), forecast
+
+def forecast_journal_record(forecast, price):
+    try:
+        with forecast_lock:
+            data = load_json_file(FORECAST_FILE, [])
+            data.append({"ts": time.time(), "price": float(price), "dir": forecast["dir"], "prob": forecast["prob"],
+                         "target": forecast["target"], "invalid": forecast["invalid"], "done": False})
+            if len(data) > FORECAST_MAX_ENTRIES:
+                data = data[-FORECAST_MAX_ENTRIES:]
+            save_json_file(FORECAST_FILE, data)
+    except:
+        pass
+
+def forecast_journal_fill_once():
+    """Закрывает прогнозы старше 24ч: изменение цены, фактическое направление, что было раньше — цель или отмена."""
+    with forecast_lock:
+        data = load_json_file(FORECAST_FILE, [])
+    changed = False
+    now_ts = time.time()
+    for e in data:
+        try:
+            if e.get("done") or now_ts - e["ts"] < FORECAST_HORIZON_H * 3600 + 600:
+                continue
+            start = int(e["ts"] // 3600 * 3600) * 1000
+            end = start + FORECAST_HORIZON_H * 3600 * 1000
+            r = requests.get("https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&start="
+                             + str(start) + "&end=" + str(end) + "&limit=30", timeout=10).json()
+            rows = r.get("result", {}).get("list", [])
+            if len(rows) < 20:
+                continue
+            rows = sorted(rows, key=lambda x: int(x[0]))
+            first = "none"
+            for row in rows[1:]:
+                hi = float(row[2]); lo = float(row[3])
+                if e["dir"] == "UP":
+                    hit_t = hi >= e["target"]; hit_i = lo <= e["invalid"]
+                elif e["dir"] == "DOWN":
+                    hit_t = lo <= e["target"]; hit_i = hi >= e["invalid"]
+                else:
+                    hit_t = False; hit_i = (hi >= max(e["target"], e["invalid"]) or lo <= min(e["target"], e["invalid"]))
+                if hit_i:
+                    first = "invalid"; break
+                if hit_t:
+                    first = "target"; break
+            close_24 = float(rows[-1][4])
+            chg = (close_24 - e["price"]) / e["price"] * 100
+            real = "UP" if chg > FORECAST_FLAT_PCT else "DOWN" if chg < -FORECAST_FLAT_PCT else "FLAT"
+            e["chg_24h"] = chg
+            e["real"] = real
+            e["dir_ok"] = (real == e["dir"])
+            e["first"] = first
+            e["done"] = True
+            changed = True
+        except:
+            continue
+    if changed:
+        with forecast_lock:
+            cur = load_json_file(FORECAST_FILE, [])
+            done_by_ts = {x["ts"]: x for x in data if x.get("done")}
+            for i, x in enumerate(cur):
+                if x["ts"] in done_by_ts:
+                    cur[i] = done_by_ts[x["ts"]]
+            save_json_file(FORECAST_FILE, cur)
+
+def forecast_journal_loop():
+    while True:
+        try:
+            forecast_journal_fill_once()
+        except:
+            pass
+        time.sleep(900)
+
+def format_forecast_report(days=30):
+    with forecast_lock:
+        data = load_json_file(FORECAST_FILE, [])
+    cutoff = time.time() - days * 86400
+    rows = [e for e in data if e.get("done") and e["ts"] >= cutoff]
+    pending = len([e for e in data if not e.get("done")])
+    line = "------------------------------"
+    head = "&#127919; <b>ЖУРНАЛ ПРОГНОЗОВ BTC — " + str(days) + " дн.</b>\n" + line + "\n"
+    if not rows:
+        return head + "Закрытых прогнозов пока нет (ожидают проверки: " + str(pending) + ").\nПрогноз проверяется через 24 часа после анализа.\n" + line + "\n<i>Usoltsev Signals</i>"
+    n = len(rows)
+    ok = len([e for e in rows if e.get("dir_ok")])
+    txt = head + "Прогнозов проверено: " + str(n) + " (ожидают: " + str(pending) + ")\n"
+    txt += "Направление угадано: " + str(ok) + " из " + str(n) + " (" + "{:.0f}".format(ok / n * 100) + "%)\n"
+    for d, name in (("UP", "Рост"), ("DOWN", "Падение"), ("FLAT", "Боковик")):
+        sub = [e for e in rows if e["dir"] == d]
+        if sub:
+            s_ok = len([e for e in sub if e.get("dir_ok")])
+            txt += "  " + name + ": " + str(s_ok) + " из " + str(len(sub)) + "\n"
+    dirs = [e for e in rows if e["dir"] in ("UP", "DOWN")]
+    if dirs:
+        t_first = len([e for e in dirs if e.get("first") == "target"])
+        i_first = len([e for e in dirs if e.get("first") == "invalid"])
+        txt += line + "\nЧто случилось раньше (за 24ч):\n"
+        txt += "  цель: " + str(t_first) + " · отмена: " + str(i_first) + " · ни то ни другое: " + str(len(dirs) - t_first - i_first) + "\n"
+        avg_move = sum((e["chg_24h"] if e["dir"] == "UP" else -e["chg_24h"]) for e in dirs) / len(dirs)
+        txt += "Среднее движение в сторону прогноза: " + "{:+.2f}".format(avg_move) + "%\n"
+    txt += line + "\nПо заявленной вероятности:\n"
+    for lo, hi, name in ((0, 50, "до 50%"), (50, 60, "50–59%"), (60, 101, "60% и выше")):
+        sub = [e for e in rows if lo <= e.get("prob", 0) < hi]
+        if sub:
+            s_ok = len([e for e in sub if e.get("dir_ok")])
+            txt += "  " + name + ": угадано " + str(s_ok) + " из " + str(len(sub)) + " (" + "{:.0f}".format(s_ok / len(sub) * 100) + "%)\n"
+    txt += line + "\nБоковик = движение меньше " + str(FORECAST_FLAT_PCT) + "% за 24ч.\n<i>Usoltsev Signals</i>"
+    return txt
+
+@app.route("/test_btc_inputs")
+def test_btc_inputs():
+    """Что получит модель сверх техники: макро, деривативы, календарь, состояние журнала прогнозов."""
+    report = {
+        "macro": get_macro_lines(),
+        "derivatives": get_btc_derivatives_lines(),
+        "calendar_48h": get_us_calendar_upcoming(48),
+        "forecast_journal_entries": len(load_json_file(FORECAST_FILE, [])),
+    }
+    if request.args.get("fill") == "1":
+        forecast_journal_fill_once()
+        report["filled"] = True
+    return json.dumps(report, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
+
+# Журнал прогнозов: закрытие прогнозов через 24ч
+forecast_journal_thread = threading.Thread(target=forecast_journal_loop, daemon=True)
+forecast_journal_thread.start()
 
 # Брифинг перед открытием биржи США (за 30 мин до 9:30 Нью-Йорка, только торговые дни)
 us_premarket_thread = threading.Thread(target=us_premarket_loop, daemon=True)
