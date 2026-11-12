@@ -107,8 +107,8 @@ TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч"
 # ID новых тем создаются ботом через /setup_signal_topics и хранятся на Volume в
 # signal_topics.json — при старте подменяют TF_TO_THREAD / THREAD_TO_TF выше.
 SIGNAL_TOPICS_FILE = "signal_topics.json"
-SIGNAL_TOPIC_NAMES = [("SV15", "связка 15 мин"), ("SV60", "связка 1 час"), ("15", "сигналы 15 мин"), ("30", "сигналы 30 мин"), ("60", "сигналы 1 час"),
-                      ("120", "сигналы 2 часа"), ("240", "сигналы 4 часа")]
+SIGNAL_TOPIC_NAMES = [("SV15", "связка 15 мин"), ("SV60", "связка 1 час"),
+                      ("15", "сигналы 15 мин"), ("60", "сигналы 1 час")]
 OLD_SIGNAL_THREADS = [THREAD_1H, THREAD_4H, THREAD_12H, THREAD_1D]   # старые темы — на удаление
 
 def apply_signal_topics():
@@ -560,12 +560,16 @@ RUSSIAN_TICKERS = ["LKOH", "SBER", "GAZP", "ROSN", "NVTK", "GMKN", "YNDX",
 US_TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT", "AMZN", "GOOGL", "META",
               "NFLX", "AMD", "INTC", "SPY", "QQQ", "BABA"]
 
+def is_market_ticker(ticker):
+    """Тикер российского или американского рынка (не крипта)."""
+    t = str(ticker).upper()
+    return any(t.startswith(r) for r in RUSSIAN_TICKERS) or any(t.startswith(u) for u in US_TICKERS)
+
 def get_ticker_thread(ticker, tf="60"):
     t = ticker.upper()
-    if any(t.startswith(r) for r in RUSSIAN_TICKERS):
-        return THREAD_RU
-    if any(t.startswith(u) for u in US_TICKERS):
-        return THREAD_US
+    # Темы RU Market / US Market удалены 12.11.2026: сигналы по этим тикерам идут в General
+    if any(t.startswith(r) for r in RUSSIAN_TICKERS) or any(t.startswith(u) for u in US_TICKERS):
+        return THREAD_GENERAL
     return TF_TO_THREAD.get(str(tf))   # ТФ без своей темы -> General
 
 # ═══════════════════════════════════════════════
@@ -813,10 +817,10 @@ def process_buffer():
         s_tf     = str(s.get("tf", "60"))
         tid = get_ticker_thread(s_ticker, s_tf)
         # Сигналы связки идут в свою тему ("SV" + ТФ), чтобы не смешиваться с сигналами совпадения
-        if signal_src(s) == "SV" and tid not in (THREAD_RU, THREAD_US):
+        if signal_src(s) == "SV" and not is_market_ticker(s_ticker):
             tid = TF_TO_THREAD.get("SV" + s_tf)
         # Крипто-сигнал не из PUBLISH_SRC: только в журнал, без сообщения в чат
-        if tid not in (THREAD_RU, THREAD_US) and signal_src(s) not in PUBLISH_SRC:
+        if not is_market_ticker(s_ticker) and signal_src(s) not in PUBLISH_SRC:
             try:
                 process_trade_signal(s_ticker, s.get("signal", ""), s.get("price", ""), s_tf)
                 process_return_signal(s_ticker, s.get("signal", ""), s.get("price", ""), s_tf)
@@ -3328,7 +3332,7 @@ def delete_topics():
     ids = [int(x) for x in raw.split(",") if x.strip().isdigit()]
     if request.args.get("confirm") != "1":
         return json.dumps({"will_delete": ids, "active_signal_topics": TF_TO_THREAD}, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
-    protected = {TF_TO_THREAD.get(k) for k in ("15", "60", "SV15", "SV60")} | {THREAD_RU, THREAD_US, THREAD_ASK_ANALYSIS}
+    protected = {TF_TO_THREAD.get(k) for k in ("15", "60", "SV15", "SV60")} | {THREAD_ASK_ANALYSIS}
     res = {}
     for tid in ids:
         if tid in protected:
@@ -3336,6 +3340,17 @@ def delete_topics():
             continue
         r = tg_api("deleteForumTopic", {"chat_id": GROUP_CHAT_ID, "message_thread_id": tid})
         res[str(tid)] = "удалена" if r.get("ok") else "ошибка: " + str(r.get("description"))
+    # убрать удалённые и устаревшие темы из сохранённой привязки ТФ -> тема
+    try:
+        keep = {k for k, _ in SIGNAL_TOPIC_NAMES}
+        data = load_json_file(SIGNAL_TOPICS_FILE, {})
+        cleaned = {k: v for k, v in data.items() if k in keep and int(v) not in ids}
+        if cleaned != data:
+            save_json_file(SIGNAL_TOPICS_FILE, cleaned)
+            apply_signal_topics()
+            res["привязка тем"] = cleaned
+    except Exception as e:
+        res["привязка тем"] = "ошибка: " + str(e)
     return json.dumps(res, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
 @app.route("/test_storage")
