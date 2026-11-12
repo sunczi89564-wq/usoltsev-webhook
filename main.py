@@ -1221,11 +1221,13 @@ def test_btc_analysis():
     """Разовый принудительный запуск полного BTC-анализа с реальной отправкой в
     Telegram (тема General) — не дожидаясь 8 часов. Полезно для проверки всего
     пайплайна целиком: свечи -> метрики -> промпт -> Opus -> отправка."""
-    text, error = run_btc_analysis(send=True)
+    do_send = request.args.get("send") == "1"
+    slot = request.args.get("slot")   # tokyo | london | ny
+    text, error = run_btc_analysis(send=do_send, slot=slot)
     return json.dumps({
-        "sent_to_telegram": error is None,
+        "sent_to_telegram": do_send and error is None,
         "error": error,
-        "preview": text[:800] if text else None
+        "preview": text if text else None
     }, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
 @app.route("/send_ticker_list")
@@ -1899,7 +1901,7 @@ def volume_alert_loop():
 # сценарии с вероятностями, риски, триггеры, резюме дня — по образцу, который
 # прислал пользователь (скриншот канала "Лев и Киса").
 CLAUDE_MODEL   = "claude-opus-5-5"
-BTC_ANALYSIS_HOURS_DUBAI = [6, 14, 22]   # время BTC-анализа по Дубаю
+# Анализ BTC выходит на открытии сессий: Токио, Лондон и перед Нью-Йорком (см. btc_analysis_loop)
 
 def get_btc_klines(interval, limit):
     """Свечи BTCUSDT с Bybit. interval: '240' = 4ч, 'D' = дневные.
@@ -2105,7 +2107,8 @@ def call_claude_opus(system_prompt, user_prompt, max_tokens=1500):
         return None, "OTHER: " + type(e).__name__ + ": " + str(e)
 
 def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary,
-                              macro_lines=None, deriv_lines=None, calendar_lines=None):
+                              macro_lines=None, deriv_lines=None, calendar_lines=None,
+                              session_lines=None, extra_lines=None, want_mood=False, max_chars=3000):
     """Собирает system + user промпт для Opus на основе готовых Python-расчётов
     и сырого контекста (свечи/новости/наши собственные данные)."""
     system_prompt = (
@@ -2125,7 +2128,12 @@ def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary,
         "календаря впереди. Отдельной фразой скажи, ПОДДЕРЖИВАЕТ этот фон основной "
         "сценарий или ПРОТИВОРЕЧИТ ему. Если макроданные помечены как устаревшие "
         "(рынок закрыт) — скажи об этом и не делай из них сильных выводов.\n"
-        "5) Блок 'Суть дня:' — 2-3 предложения итогового вывода и на что смотреть.\n\n"
+        "5) Блок 'Сессия:' — 2-3 предложения: какая торговая сессия открывается, что сделала "
+        "предыдущая (направление, размах), какие уровни от неё остались (максимум и минимум, "
+        "границы азиатского диапазона), какого размаха ждать от предстоящей сессии по статистике. "
+        "Не выводи направление предстоящей сессии из направления предыдущей — статистически "
+        "связи нет; используй сессии для оценки уровней и ожидаемого размаха движения.\n"
+        "6) Блок 'Суть дня:' — 2-3 предложения итогового вывода и на что смотреть.\n\n"
         "Как читать макро: рост доходности US10Y и DXY — давление на рисковые активы и BTC; "
         "резкое падение USDJPY (укрепление иены) — риск сворачивания кэрри-трейда и распродаж; "
         "рост золота при падающем DXY — уход от доллара, для BTC скорее плюс; рост VIX — уход "
@@ -2139,12 +2147,19 @@ def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary,
         "уровни) — используй ТОЛЬКО те, что даны тебе явно ниже, они посчитаны точно "
         "по формулам. Свечи и новости — это твой контекст для оценки вероятностей и "
         "рассуждения, не источник для новых числовых расчётов.\n\n"
-        "Весь обзор — не длиннее 3000 символов (ограничение Telegram), пиши плотно.\n\n"
+        "Весь обзор — не длиннее " + str(max_chars) + " символов (ограничение Telegram), пиши плотно.\n\n"
         "В САМОМ КОНЦЕ ответа, отдельной последней строкой, без пояснений, выведи "
         "машинную строку основного (самого вероятного) сценария на ближайшие 24 часа в формате:\n"
         "FORECAST|<UP или DOWN или FLAT>|<вероятность, целое число %>|<целевой уровень, число>|<уровень отмены сценария, число>\n"
         "Пример: FORECAST|DOWN|55|71500|75200"
     )
+    if want_mood:
+        system_prompt += (
+            "\n\nКроме того, САМОЙ ПЕРВОЙ строкой ответа (до заголовка) выведи общий настрой рынка "
+            "перед открытием США в формате: НАСТРОЙ: RISK-ON или НАСТРОЙ: RISK-OFF или НАСТРОЙ: НЕЙТРАЛЬНО. "
+            "В блоке 'Макрофон и деривативы' учти данные перед открытием США (фьючерсы, акции, новости), "
+            "если они даны ниже."
+        )
 
     lines = []
     lines.append("ТЕКУЩИЕ ДАННЫЕ ПО BTC (посчитаны точно, используй как есть):")
@@ -2169,6 +2184,16 @@ def build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary,
             lines.append("- " + h)
     else:
         lines.append("(новости недоступны в этот раз)")
+
+    if session_lines:
+        lines.append("")
+        lines.append("ТОРГОВЫЕ СЕССИИ (BTC, часовые свечи Bybit; время UTC):")
+        lines.extend(session_lines)
+
+    if extra_lines:
+        lines.append("")
+        lines.append("ПЕРЕД ОТКРЫТИЕМ США (фьючерсы, фон риска, токенизированные акции, события, новости):")
+        lines.extend(extra_lines)
 
     if macro_lines:
         lines.append("")
@@ -2246,12 +2271,96 @@ def get_last_volume_summary_text(coin="BTC"):
     except:
         return None
 
-def run_btc_analysis(send=True):
-    """Полный проход: считает метрики, собирает промпт, вызывает Opus, при send=True
-    отправляет в THREAD_GENERAL. Возвращает (text, error) для диагностики."""
+SESSION_NAMES = {"tokyo": "Азия (Токио)", "london": "Европа (Лондон)", "ny": "США (Нью-Йорк)"}
+# Типичные значения по BTC за 773 будних дня (11.2023–11.2026), часовые свечи Bybit
+SESSION_TYPICAL = {"asia": (2.0, 0.9), "europe": (1.7, 0.8), "us": (2.9, 1.4)}   # (средний размах %, среднее движение %)
+
+def _last_sunday(year, month):
+    nxt = datetime(year + (month // 12), (month % 12) + 1, 1)
+    last = nxt - timedelta(days=1)
+    return last.day - (last.weekday() + 1) % 7
+
+def london_open_utc_hour(dt_utc):
+    """Час открытия Лондона (08:00 местного) в UTC: 7 летом (BST), 8 зимой."""
+    y = dt_utc.year
+    start = datetime(y, 3, _last_sunday(y, 3), 1, tzinfo=timezone.utc)
+    end = datetime(y, 10, _last_sunday(y, 10), 1, tzinfo=timezone.utc)
+    return 7 if start <= dt_utc < end else 8
+
+def ny_open_utc_hour(dt_utc):
+    """Час, в который попадает открытие NYSE (9:30 Нью-Йорка), в UTC: 13 летом, 14 зимой."""
+    return 9 - ny_utc_offset_hours(dt_utc)
+
+def _session_stats(rows_by_ts, start_utc, end_utc):
+    """Статистика по часовым свечам в окне [start, end). None, если свечей нет."""
+    seg = []
+    t = start_utc
+    while t < end_utc:
+        r = rows_by_ts.get(int(t.timestamp() * 1000))
+        if r:
+            seg.append(r)
+        t += timedelta(hours=1)
+    if not seg:
+        return None
+    o = float(seg[0][1]); c = float(seg[-1][4])
+    hi = max(float(r[2]) for r in seg); lo = min(float(r[3]) for r in seg)
+    return {"open": o, "close": c, "high": hi, "low": lo, "chg": (c - o) / o * 100, "range": (hi - lo) / o * 100,
+            "bars": len(seg), "full": len(seg) >= int((end_utc - start_utc).total_seconds() // 3600)}
+
+def _fmt_session(name, st):
+    if not st:
+        return name + ": нет данных"
+    return (name + ": изменение " + "{:+.2f}".format(st["chg"]) + "%, максимум $" + "{:,.0f}".format(st["high"])
+            + ", минимум $" + "{:,.0f}".format(st["low"]) + ", размах " + "{:.2f}".format(st["range"]) + "%"
+            + ("" if st["full"] else " (сессия ещё идёт или данные неполные)"))
+
+def get_session_lines(slot=None):
+    """Блок данных о торговых сессиях для промпта анализа BTC."""
+    try:
+        rows = get_btc_klines("60", 60)
+        if len(rows) < 30:
+            return []
+        by_ts = {int(r[0]): r for r in rows}
+        now_utc = datetime.now(timezone.utc)
+        day = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc)
+        prev = day - timedelta(days=1)
+        def windows(d):
+            lo_h = london_open_utc_hour(d); ny_h = ny_open_utc_hour(d)
+            return {"asia": (d, d + timedelta(hours=lo_h)),
+                    "europe": (d + timedelta(hours=lo_h), d + timedelta(hours=ny_h)),
+                    "us": (d + timedelta(hours=ny_h), d + timedelta(hours=ny_h + 7))}
+        wt, wp = windows(day), windows(prev)
+        out = []
+        if slot in SESSION_NAMES:
+            out.append("Сейчас открывается сессия: " + SESSION_NAMES[slot])
+        if now_utc.weekday() >= 5:
+            out.append("Сегодня выходной: традиционные биржи закрыты, ликвидность в крипте ниже обычной.")
+        out.append(_fmt_session("Вчера, сессия США", _session_stats(by_ts, *wp["us"])))
+        a = _session_stats(by_ts, *wt["asia"])
+        if a:
+            out.append(_fmt_session("Сегодня, Азия", a))
+            out.append("Азиатский диапазон дня: $" + "{:,.0f}".format(a["low"]) + " – $" + "{:,.0f}".format(a["high"])
+                       + " (выход из него случается почти каждый день; сам пробой направление дня не гарантирует)")
+        e = _session_stats(by_ts, *wt["europe"])
+        if e:
+            out.append(_fmt_session("Сегодня, Европа", e))
+        u = _session_stats(by_ts, *wt["us"])
+        if u:
+            out.append(_fmt_session("Сегодня, США", u))
+        out.append("Типичные значения по статистике за 3 года (будни): Азия — размах " + str(SESSION_TYPICAL["asia"][0])
+                   + "%, движение " + str(SESSION_TYPICAL["asia"][1]) + "%; Европа — " + str(SESSION_TYPICAL["europe"][0])
+                   + "% и " + str(SESSION_TYPICAL["europe"][1]) + "%; США — " + str(SESSION_TYPICAL["us"][0]) + "% и "
+                   + str(SESSION_TYPICAL["us"][1]) + "%. Самые активные часы — вокруг открытия Нью-Йорка.")
+        out.append("Проверено на истории: направление предыдущей сессии НЕ предсказывает направление следующей (совпадает в 48–54% дней).")
+        return out
+    except:
+        return []
+
+def generate_btc_analysis(slot=None, extra_lines=None, want_mood=False, record=True, max_chars=3000):
+    """Собирает все данные, вызывает Opus. Возвращает (text, error, mood). При record=True пишет прогноз в журнал."""
     metrics = build_btc_metrics()
     if metrics is None:
-        return None, "Не удалось получить достаточно свечей BTC с Bybit"
+        return None, "Не удалось получить достаточно свечей BTC с Bybit", None
 
     news = get_crypto_news_headlines()
     whale_summary = get_last_whale_summary_text() if WHALES_ENABLED else None
@@ -2260,21 +2369,42 @@ def run_btc_analysis(send=True):
     macro_lines = get_macro_lines()
     deriv_lines = get_btc_derivatives_lines()
     calendar_lines = get_us_calendar_upcoming(48)
+    session_lines = get_session_lines(slot)
 
     system_prompt, user_prompt = build_btc_analysis_prompt(metrics, news, whale_summary, volume_summary,
-                                                            macro_lines, deriv_lines, calendar_lines)
-    text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=2200)
+                                                            macro_lines, deriv_lines, calendar_lines,
+                                                            session_lines, extra_lines, want_mood, max_chars)
+    text, error = call_claude_opus(system_prompt, user_prompt, max_tokens=2400)
+    if error:
+        return None, error, None
+
+    # Машинная строка прогноза: вырезаем из текста и пишем в журнал
+    text, forecast = extract_forecast_line(text)
+    if record and forecast:
+        forecast_journal_record(forecast, metrics["price"])
+
+    mood = None
+    if want_mood:
+        ls = text.split("\n")
+        for i, l in enumerate(ls[:3]):
+            if l.strip().upper().startswith("НАСТРОЙ"):
+                mood = l.split(":", 1)[1].strip().upper() if ":" in l else ""
+                text = "\n".join(ls[:i] + ls[i + 1:]).strip()
+                break
+    return text, None, mood
+
+def run_btc_analysis(send=True, slot=None):
+    """Отдельное сообщение с анализом BTC. Возвращает (text, error) для диагностики."""
+    text, error, _ = generate_btc_analysis(slot=slot, record=send)
     if error:
         return None, error
 
-    # Машинная строка прогноза: вырезаем из текста и (при реальной отправке) пишем в журнал
-    text, forecast = extract_forecast_line(text)
-    if send and forecast:
-        forecast_journal_record(forecast, metrics["price"])
-
     line = "------------------------------"
+    title = "&#8383; <b>АНАЛИЗ BTC</b>"
+    if slot in SESSION_NAMES:
+        title += " · открытие сессии: " + SESSION_NAMES[slot]
     full_text = (
-        "&#8383; <b>АНАЛИЗ BTC</b>\n"
+        title + "\n"
         + now_local().strftime("%d.%m.%Y  %H:%M") + " " + DUBAI_LABEL + "\n"
         + line + "\n"
         + text + "\n"
@@ -2288,18 +2418,24 @@ def run_btc_analysis(send=True):
     return full_text, None
 
 def btc_analysis_loop():
-    """Фоновый поток: раз в минуту проверяет, не наступил ли один из часов
-    BTC_ANALYSIS_HOURS_DUBAI (по Дубаю) — и запускает анализ один раз в этот час.
-    Больше не стреляет при каждом редеплое и не сдвигается от времени деплоя."""
+    """Фоновый поток: анализ BTC на открытии Токио (04:00 Дубая) и Лондона (08:00 Лондона =
+    12:00 Дубая зимой, 11:00 летом). Слот перед открытием Нью-Йорка ведёт us_premarket_loop:
+    там анализ объединён с брифингом перед открытием США."""
     last_sent_key = None
     while True:
         try:
-            now = now_local()
-            if now.hour in BTC_ANALYSIS_HOURS_DUBAI and now.minute == 0:
-                key = now.strftime("%Y-%m-%d-%H")
+            now_utc = datetime.now(timezone.utc)
+            slot = None
+            if now_utc.minute == 0:
+                if now_utc.hour == 0:
+                    slot = "tokyo"
+                elif now_utc.hour == london_open_utc_hour(now_utc):
+                    slot = "london"
+            if slot:
+                key = now_utc.strftime("%Y-%m-%d-") + slot
                 if key != last_sent_key:
-                    run_btc_analysis(send=True)
                     last_sent_key = key
+                    run_btc_analysis(send=True, slot=slot)
         except:
             pass
         time.sleep(30)
@@ -3034,25 +3170,16 @@ def run_us_premarket(send=True):
     if news:
         data_lines.append("Новости рынка США: " + " | ".join(news))
 
-    system_prompt = (
-        "Ты — аналитик, который пишет короткий брифинг перед открытием американской биржи "
-        "для приватного Telegram-канала крипто-трейдера. Отвечай по-русски, простым текстом "
-        "без HTML и markdown. Формат строго:\n"
-        "Строка 1: НАСТРОЙ: RISK-ON, RISK-OFF или НЕЙТРАЛЬНО\n"
-        "Далее 3-5 коротких предложений: что задаёт тон (фьючерсы, VIX, доллар, доходности, события дня, "
-        "новости), главные риски сессии и чего ждать от BTC/ETH на открытии США. "
-        "Опирайся только на данные ниже, не выдумывай цифры."
-    )
-    raw, err = call_claude_opus(system_prompt, "\n".join(data_lines), max_tokens=1200)
-    mood_line, summary = "", ""
-    if raw:
-        ls = [l.strip() for l in raw.strip().split("\n") if l.strip()]
-        if ls and ls[0].upper().startswith("НАСТРОЙ"):
-            mood = ls[0].split(":", 1)[1].strip().upper() if ":" in ls[0] else ""
-            emoji = "&#128994;" if "ON" in mood else ("&#128308;" if "OFF" in mood else "&#9898;")
-            mood_line = emoji + " <b>" + html_escape(mood) + "</b>"
-            ls = ls[1:]
-        summary = html_escape(" ".join(ls))
+    # Вывод: анализ BTC (техника, макро, деривативы, сессии) с учётом данных перед открытием США.
+    # Один вызов Opus вместо двух отдельных сообщений.
+    analysis, err, mood = generate_btc_analysis(slot="ny", extra_lines=data_lines, want_mood=True,
+                                                record=send, max_chars=2300)
+    mood_line = ""
+    if mood:
+        emoji = "&#128994;" if "ON" in mood else ("&#128308;" if "OFF" in mood else "&#9898;")
+        mood_line = emoji + " <b>" + html_escape(mood) + "</b>"
+    if analysis:
+        summary = analysis
     else:
         summary = "&#9888; Анализ недоступен: " + html_escape(err or "")
 
@@ -3076,11 +3203,17 @@ def run_us_premarket(send=True):
         parts += calendar
     else:
         parts += ["значимых событий нет"]
-    parts += [line, "&#129504; <b>ВЫВОД</b>" + ((" · " + mood_line) if mood_line else ""), summary, line,
-              "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"]
-    text = "\n".join(parts)
+    head = "\n".join(parts + [line])
+    tail = "\n".join(["&#8383; <b>АНАЛИЗ BTC</b> · открытие сессии: США" + ((" · " + mood_line) if mood_line else ""),
+                      summary, line, "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"])
+    text = head + "\n" + tail
     if send:
-        send_telegram(text, THREAD_GENERAL)
+        if len(text) <= 4000:
+            send_telegram(text, THREAD_GENERAL)
+        else:
+            # не влезает в лимит Telegram — два сообщения подряд
+            send_telegram(head, THREAD_GENERAL)
+            send_telegram(tail, THREAD_GENERAL)
     return text
 
 def us_premarket_loop():
@@ -3091,11 +3224,14 @@ def us_premarket_loop():
             open_dubai, is_trading = next_us_open_info(now_utc)
             send_at = open_dubai - timedelta(minutes=US_PREMARKET_LEAD_MIN)
             now_d = now_utc.astimezone(DUBAI_TZ)
-            if is_trading and send_at <= now_d < send_at + timedelta(minutes=2):
+            if send_at <= now_d < send_at + timedelta(minutes=2):
                 key = send_at.strftime("%Y-%m-%d")
                 if key != last_key:
                     last_key = key
-                    run_us_premarket(send=True)
+                    if is_trading:
+                        run_us_premarket(send=True)          # брифинг + анализ BTC одним сообщением
+                    else:
+                        run_btc_analysis(send=True, slot="ny")   # выходной/праздник: только анализ BTC
         except:
             pass
         time.sleep(30)
