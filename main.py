@@ -50,6 +50,16 @@ def load_json_file(name, default):
             pass
     return default
 
+# ═══════════════════════════════════════════════
+# ПУЛЬС ФОНОВЫХ ПОТОКОВ (видно на /health)
+# ═══════════════════════════════════════════════
+# Каждый фоновый цикл отмечается на каждом проходе. Если поток завис или умер,
+# его отметка перестаёт обновляться — это видно сразу, без чтения логов Railway.
+THREAD_BEAT = {}
+
+def beat(name, note=None):
+    THREAD_BEAT[name] = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "note": note}
+
 def save_json_file(name, data):
     """Атомарная запись: сначала во временный файл, потом замена — чтобы при
     перезапуске посреди записи файл не оказался битым."""
@@ -180,6 +190,7 @@ def price_tracker_loop():
     """Фоновый поток: обновляет max_price/min_price по всем открытым позициям."""
     while True:
         try:
+            beat("price_tracker")
             with trades_lock:
                 data = load_trades_data()
                 positions = dict(data.get("open_positions", {}))
@@ -763,6 +774,11 @@ def get_news():
 # ОТПРАВКА В TELEGRAM
 # ═══════════════════════════════════════════════
 def send_telegram(text, thread_id=None):
+    """Отправка сообщения в группу. Возвращает True/False.
+
+    Таймаут здесь обязателен: без него зависший запрос к Telegram блокирует вызвавший
+    фоновый поток НАВСЕГДА — и расписание замолкает целиком, без единой ошибки в чате.
+    Ответ тоже разбираем: удалённая тема или вылетевший бот раньше просто не замечались."""
     url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
     payload = {
         "chat_id": GROUP_CHAT_ID,
@@ -771,7 +787,27 @@ def send_telegram(text, thread_id=None):
     }
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
-    requests.post(url, json=payload)
+    last = ""
+    for attempt in (1, 2, 3):
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            try:
+                j = r.json()
+            except:
+                j = {}
+            if j.get("ok"):
+                return True
+            last = str(j.get("description") or ("HTTP " + str(r.status_code)))[:200]
+            # 400 — тема удалена или битая разметка, 403 — бота выгнали: повтор не поможет
+            if r.status_code in (400, 403):
+                break
+        except Exception as e:
+            last = type(e).__name__ + ": " + str(e)[:160]
+        if attempt < 3:
+            time.sleep(2 * attempt)
+    print("[send_telegram] НЕ отправлено (thread_id=" + str(thread_id) + "): " + last, flush=True)
+    beat("telegram_last_error", last)
+    return False
 
 def send_telegram_ex(text, thread_id=None, reply_to=None):
     """То же, что send_telegram, но возвращает message_id отправленного сообщения
@@ -2412,32 +2448,99 @@ def run_btc_analysis(send=True, slot=None):
         + "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"
     )
 
-    if send:
-        send_telegram(full_text, THREAD_GENERAL)
+    if send and not send_telegram(full_text, THREAD_GENERAL):
+        return None, "сообщение не ушло в Telegram"
 
     return full_text, None
+
+# ═══════════════════════════════════════════════
+# ЖУРНАЛ ОТПРАВЛЕННЫХ СЛОТОВ (переживает редеплой)
+# ═══════════════════════════════════════════════
+# Раньше слот ловился ровно в минуту HH:00 и жил только в памяти процесса. Если
+# Railway в этот момент передеплоился или поток был занят — сообщение терялось молча
+# и навсегда. Теперь факт отправки лежит на диске, а пропущенный слот досылается.
+SLOTS_FILE       = "sent_slots.json"
+SLOT_CATCHUP_MIN = 120      # насколько поздно ещё имеет смысл досылать пропущенный слот
+SLOT_RETRY_SEC   = 600      # пауза между попытками, если анализ не собрался
+SLOT_MAX_TRIES   = 3
+
+_slot_fail = {}             # key -> (попыток, время последней); в памяти: после рестарта пробуем заново
+
+def _slot_log():
+    d = load_json_file(SLOTS_FILE, {})
+    return d if isinstance(d, dict) else {}
+
+def _slot_done(key):
+    return key in _slot_log()
+
+def _slot_mark(key):
+    d = _slot_log()
+    d[key] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for k in sorted(d.keys())[:-40]:        # храним последние 40 записей
+        d.pop(k, None)
+    save_json_file(SLOTS_FILE, d)
+
+def _slot_try(key, slot_name, runner):
+    """Общая обвязка для слотов расписания: отправить, при ошибке — повторить,
+    после SLOT_MAX_TRIES неудач сдаться и сказать об этом в чат, а не молчать.
+    runner() -> (ok: bool, error: str|None)."""
+    if _slot_done(key):
+        return
+    tries, last_try = _slot_fail.get(key, (0, 0.0))
+    if tries and time.time() - last_try < SLOT_RETRY_SEC:
+        return
+    try:
+        ok, error = runner()
+    except Exception as e:
+        ok, error = False, type(e).__name__ + ": " + str(e)[:200]
+    if ok:
+        _slot_mark(key)
+        _slot_fail.pop(key, None)
+        return
+    tries += 1
+    _slot_fail[key] = (tries, time.time())
+    print("[slot] " + key + " попытка " + str(tries) + " неудачна: " + str(error)[:200], flush=True)
+    if tries == 1:
+        safe = str(error or "неизвестная ошибка")[:300].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        send_telegram("&#9888; <b>" + slot_name + "</b>: сообщение не собралось.\n"
+                      + safe + "\nПробую ещё.", THREAD_GENERAL)
+    elif tries >= SLOT_MAX_TRIES:
+        _slot_mark(key)
+        send_telegram("&#9888; <b>" + slot_name + "</b>: не вышло за " + str(SLOT_MAX_TRIES)
+                      + " попытки, слот пропущен.", THREAD_GENERAL)
+
+def btc_due_slots(now_utc):
+    """Слоты сегодняшнего дня, время которых уже наступило и ещё не просрочено."""
+    out = []
+    day = now_utc.strftime("%Y-%m-%d")
+    for slot, h in (("tokyo", 0), ("london", london_open_utc_hour(now_utc))):
+        sched = now_utc.replace(hour=h, minute=0, second=0, microsecond=0)
+        if sched <= now_utc <= sched + timedelta(minutes=SLOT_CATCHUP_MIN):
+            out.append((day + "-" + slot, slot, sched))
+    return out
 
 def btc_analysis_loop():
     """Фоновый поток: анализ BTC на открытии Токио (04:00 Дубая) и Лондона (08:00 Лондона =
     12:00 Дубая зимой, 11:00 летом). Слот перед открытием Нью-Йорка ведёт us_premarket_loop:
-    там анализ объединён с брифингом перед открытием США."""
-    last_sent_key = None
+    там анализ объединён с брифингом перед открытием США.
+    Отправленные слоты пишутся на диск; пропущенный досылается в течение 2 часов."""
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
-            slot = None
-            if now_utc.minute == 0:
-                if now_utc.hour == 0:
-                    slot = "tokyo"
-                elif now_utc.hour == london_open_utc_hour(now_utc):
-                    slot = "london"
-            if slot:
-                key = now_utc.strftime("%Y-%m-%d-") + slot
-                if key != last_sent_key:
-                    last_sent_key = key
-                    run_btc_analysis(send=True, slot=slot)
-        except:
-            pass
+            beat("btc_analysis")
+            for key, slot, sched in btc_due_slots(now_utc):
+                late = int((now_utc - sched).total_seconds() // 60)
+
+                def runner(slot=slot):
+                    text, error = run_btc_analysis(send=True, slot=slot)
+                    return (text is not None and not error), error
+
+                before = _slot_done(key)
+                _slot_try(key, "Анализ BTC · " + SESSION_NAMES.get(slot, slot), runner)
+                if not before and _slot_done(key) and late >= 5:
+                    print("[btc] слот " + key + " отправлен с опозданием " + str(late) + " мин", flush=True)
+        except Exception as e:
+            print("[btc_analysis_loop] " + type(e).__name__ + ": " + str(e)[:200], flush=True)
         time.sleep(30)
 
 # ═══════════════════════════════════════════════
@@ -3207,42 +3310,50 @@ def run_us_premarket(send=True):
     tail = "\n".join(["&#8383; <b>АНАЛИЗ BTC</b> · открытие сессии: США" + ((" · " + mood_line) if mood_line else ""),
                       summary, line, "<i>Usoltsev Signals · " + CLAUDE_MODEL + "</i>"])
     text = head + "\n" + tail
+    sent = None
     if send:
         if len(text) <= 4000:
-            send_telegram(text, THREAD_GENERAL)
+            sent = send_telegram(text, THREAD_GENERAL)
         else:
             # не влезает в лимит Telegram — два сообщения подряд
-            send_telegram(head, THREAD_GENERAL)
-            send_telegram(tail, THREAD_GENERAL)
-    return text
+            sent = send_telegram(head, THREAD_GENERAL)
+            sent = send_telegram(tail, THREAD_GENERAL) and sent
+    return text, sent
 
 def us_premarket_loop():
-    last_key = None
+    """Брифинг перед открытием США за 30 минут (в торговый день — вместе с анализом BTC).
+    Факт отправки лежит на диске: пропущенный из-за перезапуска брифинг досылается в
+    течение 2 часов, а не теряется, как раньше, из-за двухминутного окна в памяти."""
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
+            beat("us_premarket")
             open_dubai, is_trading = next_us_open_info(now_utc)
             send_at = open_dubai - timedelta(minutes=US_PREMARKET_LEAD_MIN)
             now_d = now_utc.astimezone(DUBAI_TZ)
-            if send_at <= now_d < send_at + timedelta(minutes=2):
-                key = send_at.strftime("%Y-%m-%d")
-                if key != last_key:
-                    last_key = key
+            if send_at <= now_d <= send_at + timedelta(minutes=SLOT_CATCHUP_MIN):
+                key = "premarket-" + send_at.strftime("%Y-%m-%d")
+
+                def runner(is_trading=is_trading):
                     if is_trading:
-                        run_us_premarket(send=True)          # брифинг + анализ BTC одним сообщением
-                    else:
-                        run_btc_analysis(send=True, slot="ny")   # выходной/праздник: только анализ BTC
-        except:
-            pass
+                        text, sent = run_us_premarket(send=True)   # брифинг + анализ BTC одним сообщением
+                        return bool(sent), (None if sent else "сообщение не ушло в Telegram")
+                    text, error = run_btc_analysis(send=True, slot="ny")   # выходной/праздник: только анализ BTC
+                    return (text is not None and not error), error
+
+                _slot_try(key, "Брифинг перед открытием США", runner)
+        except Exception as e:
+            print("[us_premarket_loop] " + type(e).__name__ + ": " + str(e)[:200], flush=True)
         time.sleep(30)
 
 @app.route("/test_us_premarket")
 def test_us_premarket():
     """Превью брифинга перед открытием США. ?send=1 — отправить в General."""
-    text = run_us_premarket(send=(request.args.get("send") == "1"))
+    text, sent = run_us_premarket(send=(request.args.get("send") == "1"))
     open_dt, is_trading = next_us_open_info()
     return ("Открытие NYSE сегодня: " + open_dt.strftime("%d.%m %H:%M") + " (Дубай), торговый день: "
-            + str(is_trading) + "\n\n" + text), 200, {"Content-Type": "text/plain; charset=utf-8"}
+            + str(is_trading) + "\nОтправлено в Telegram: " + str(sent)
+            + "\n\n" + text), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 # ═══════════════════════════════════════════════
 # ЖУРНАЛ КИТОВ: предсказывает ли китовый поток движение цены?
@@ -3748,6 +3859,7 @@ def forecast_journal_fill_once():
 def forecast_journal_loop():
     while True:
         try:
+            beat("forecast_journal")
             forecast_journal_fill_once()
         except:
             pass
@@ -3788,6 +3900,38 @@ def format_forecast_report(days=30):
             txt += "  " + name + ": угадано " + str(s_ok) + " из " + str(len(sub)) + " (" + "{:.0f}".format(s_ok / len(sub) * 100) + "%)\n"
     txt += line + "\nБоковик = движение меньше " + str(FORECAST_FLAT_PCT) + "% за 24ч.\n<i>Usoltsev Signals</i>"
     return txt
+
+@app.route("/health")
+def health():
+    """Живы ли фоновые потоки и какие слоты расписания уже отправлены сегодня.
+    Если у потока 'секунд назад' растёт без остановки — он завис, нужен рестарт."""
+    now = datetime.now(timezone.utc)
+    threads = []
+    for name, info in sorted(THREAD_BEAT.items()):
+        age = None
+        try:
+            age = int((now - datetime.fromisoformat(info["ts"])).total_seconds())
+        except:
+            pass
+        row = {"поток": name, "последний проход (UTC)": info.get("ts"), "секунд назад": age}
+        if info.get("note"):
+            row["примечание"] = info["note"]
+        threads.append(row)
+    open_dt, is_trading = next_us_open_info(now)
+    body = {
+        "время сервера (UTC)": now.isoformat(timespec="seconds"),
+        "время Дубая": now_local().strftime("%d.%m.%Y %H:%M"),
+        "потоки": threads,
+        "расписание сегодня (Дубай)": {
+            "Токио": "04:00",
+            "Лондон": "%02d:00" % ((london_open_utc_hour(now) + 4) % 24),
+            "перед США": (open_dt - timedelta(minutes=US_PREMARKET_LEAD_MIN)).strftime("%H:%M")
+                         + (" (торговый день)" if is_trading else " (биржа закрыта — только анализ BTC)"),
+        },
+        "отправленные слоты": _slot_log(),
+        "неудачные попытки сейчас": {k: v[0] for k, v in _slot_fail.items()},
+    }
+    return json.dumps(body, indent=2, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
 
 @app.route("/test_btc_inputs")
 def test_btc_inputs():
