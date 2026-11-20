@@ -109,7 +109,9 @@ THREAD_TO_TF = {
     THREAD_12H: "720",
     THREAD_1D:  "D",
 }
-TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д", "15": "15м", "CF": "совпадение 1ч", "CF15": "совпадение 15м", "SV15": "связка 15м", "SV60": "связка 1ч"}
+TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч", "D": "1д", "15": "15м",
+            "CF": "совпадение 1ч", "CF15": "совпадение 15м", "CF240": "совпадение 4ч", "CF720": "совпадение 12ч",
+            "SV15": "связка 15м", "SV60": "связка 1ч", "SV240": "связка 4ч", "SV720": "связка 12ч"}
 
 # ═══════════════════════════════════════════════
 # СИГНАЛЬНЫЕ ТЕМЫ UT BOT (30м / 1ч / 2ч / 4ч)
@@ -117,8 +119,10 @@ TF_LABEL = {"30": "30м", "60": "1ч", "120": "2ч", "240": "4ч", "720": "12ч"
 # ID новых тем создаются ботом через /setup_signal_topics и хранятся на Volume в
 # signal_topics.json — при старте подменяют TF_TO_THREAD / THREAD_TO_TF выше.
 SIGNAL_TOPICS_FILE = "signal_topics.json"
-SIGNAL_TOPIC_NAMES = [("SV15", "связка 15 мин"), ("SV60", "связка 1 час"),
-                      ("15", "сигналы 15 мин"), ("60", "сигналы 1 час")]
+# 20.11.2026: ушли с 15 мин и 1 часа на 4 часа и 12 часов — на младших ТФ было слишком
+# много шума (≈29 сигналов в день против ≈13 в месяц на старших).
+SIGNAL_TOPIC_NAMES = [("SV240", "связка 4 часа"), ("SV720", "связка 12 часов"),
+                      ("240", "сигналы 4 часа"), ("720", "сигналы 12 часов")]
 OLD_SIGNAL_THREADS = [THREAD_1H, THREAD_4H, THREAD_12H, THREAD_1D]   # старые темы — на удаление
 
 def apply_signal_topics():
@@ -1423,8 +1427,8 @@ def telegram_updates():
     # "/statsmonth cf" — статистика только по сигналам совпадения, "/statsmonth ut" — только UT Bot этой темы
     _stat_args = [a.lower() for a in text.split()[1:]]
     if text.startswith("/stats") and "ut" not in _stat_args:
-        if tf_filter in ("60", "15"):
-            tf_filter = cf_journal_tf(tf_filter)   # в темах 1ч и 15м по умолчанию — опубликованные сигналы совпадения
+        if tf_filter in ("240", "720"):
+            tf_filter = cf_journal_tf(tf_filter)   # в темах 4ч и 12ч по умолчанию — опубликованные сигналы совпадения
         elif "cf" in _stat_args:
             tf_filter = CF_JOURNAL_TF
 
@@ -3579,7 +3583,9 @@ def delete_topics():
     ids = [int(x) for x in raw.split(",") if x.strip().isdigit()]
     if request.args.get("confirm") != "1":
         return json.dumps({"will_delete": ids, "active_signal_topics": TF_TO_THREAD}, ensure_ascii=False), 200, {"Content-Type": "application/json; charset=utf-8"}
-    protected = {TF_TO_THREAD.get(k) for k in ("15", "60", "SV15", "SV60")} | {THREAD_ASK_ANALYSIS}
+    # защищаем ровно те темы, в которые бот сейчас публикует — список берём из SIGNAL_TOPIC_NAMES,
+    # чтобы при смене таймфреймов не забыть поправить его здесь
+    protected = {TF_TO_THREAD.get(k) for k, _ in SIGNAL_TOPIC_NAMES} | {THREAD_ASK_ANALYSIS}
     res = {}
     for tid in ids:
         if tid in protected:
